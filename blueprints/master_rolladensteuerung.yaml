@@ -14,6 +14,7 @@ blueprint:
     - V83: Extrem-Hitzeschutz mit Hysterese (Innen- und Aussentemperatur).
     - V82: Anti-Flapping Fixes (PV-Trigger 2min, mode restart, time_pattern 15min)
   domain: automation
+  source_url: https://raw.githubusercontent.com/alexsilbernagel/ha-rolladensteuerung/main/blueprints/master_rolladensteuerung.yaml
   input:
     rollo_entity:
       name: Rollo
