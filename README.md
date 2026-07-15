@@ -1,6 +1,4 @@
-[README.md](https://github.com/user-attachments/files/30037165/README.md)
-# ha-rolladensteuerung
-Vollautomatische Rolladensteuerung für Home Assistant: Sonnenstandsbeschattung, Extrem-Hitzeschutz, Lüftungs- und Durchgangslogik mit Präsenz- und Feiertagserkennung.
+[README.md](https://github.com/user-attachments/files/30037799/README.md)
 <a name="top"></a>
 
 **🇬🇧 English | [🇩🇪 Deutsch](#deutsch)**
@@ -15,12 +13,12 @@ A comprehensive blueprint for fully automated control of individual roller shutt
 
 ## Import
 
-[![Open your Home Assistant instance and show the blueprint import dialog.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fraw.githubusercontent.com%2F<USER>%2F<REPO>%2Fmain%2Fblueprints%2Fmaster_rolladensteuerung.yaml)
+[![Open your Home Assistant instance and show the blueprint import dialog.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fraw.githubusercontent.com%2Falexsilbernagel%2Fha-rolladensteuerung%2Fmain%2Fblueprints%2Fmaster_rolladensteuerung.yaml)
 
 Or manually: **Settings → Automations & Scenes → Blueprints → Import Blueprint** and paste this URL:
 
 ```
-https://raw.githubusercontent.com/<USER>/<REPO>/main/blueprints/master_rolladensteuerung.yaml
+https://raw.githubusercontent.com/alexsilbernagel/ha-rolladensteuerung/main/blueprints/master_rolladensteuerung.yaml
 ```
 
 ## What the blueprint does
@@ -132,12 +130,12 @@ Ein umfassender Blueprint zur vollautomatischen Steuerung einzelner Rollos in Ho
 
 ## Import
 
-[![Open your Home Assistant instance and show the blueprint import dialog.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fraw.githubusercontent.com%2F<USER>%2F<REPO>%2Fmain%2Fblueprints%2Fmaster_rolladensteuerung.yaml)
+[![Open your Home Assistant instance and show the blueprint import dialog.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fraw.githubusercontent.com%2Falexsilbernagel%2Fha-rolladensteuerung%2Fmain%2Fblueprints%2Fmaster_rolladensteuerung.yaml)
 
 Alternativ manuell: **Einstellungen → Automatisierungen & Szenen → Blueprints → Blueprint importieren** und diese URL einfügen:
 
 ```
-https://raw.githubusercontent.com/<USER>/<REPO>/main/blueprints/master_rolladensteuerung.yaml
+https://raw.githubusercontent.com/alexsilbernagel/ha-rolladensteuerung/main/blueprints/master_rolladensteuerung.yaml
 ```
 
 ## Was der Blueprint macht
