@@ -1,0 +1,594 @@
+blueprint:
+  name: "Master-Rolladensteuerung V84 (Durchgang & Extrem-Hitzeschutz)"
+  description: >
+    V84 - Durchgangs-Logik & Bugfix:
+    - NEU: Fenster ganz offen faehrt das Rollo GANZ AUF (max_oeffnung), wenn KEIN
+      Sonnenstands-Modus (Beschattung / Extrem-Hitzeschutz) aktiv ist.
+      Wirkt auch nachts, vor der Morgen-Oeffnungszeit und bei manuell geschlossenem Rollo.
+    - NEU: Bei aktiver Beschattung/Hitzeschutz weiterhin nur bis zur Durchgangsposition.
+    - FIX: Variablen-Reihenfolge - sonne_auf_f wird jetzt VOR hitze_alarm/hitze_extrem
+      definiert (vorher undefined -> Extrem-Hitzeschutz griff nicht zuverlaessig).
+    - NEU: Hilfsvariablen sonne_stark / beschattung_aktiv (entzerrt die Sonnen-Logik).
+    - Brandalarm bleibt oberste Prioritaet: Blueprint haelt still (stop), das Oeffnen
+      uebernimmt die separate Brandalarm-Automatisierung.
+    - V83: Extrem-Hitzeschutz mit Hysterese (Innen- und Aussentemperatur).
+    - V82: Anti-Flapping Fixes (PV-Trigger 2min, mode restart, time_pattern 15min)
+  domain: automation
+  input:
+    rollo_entity:
+      name: Rollo
+      selector:
+        entity:
+          domain: cover
+    himmelsrichtung:
+      name: Himmelsrichtung
+      selector:
+        select:
+          options:
+            - "Nord (315-45)"
+            - "Nordost (0-90)"
+            - "Ost (45-135)"
+            - "Südost (90-180)"
+            - "Süd (135-225)"
+            - "Süd-Terrasse (100-245)"
+            - "Südwest (180-270)"
+            - "West (225-330)"
+            - "West Kinderzimmer (215-335)"
+            - "Nordwest (270-360)"
+    brandalarm_entity:
+      name: Brandalarm Status (Input Boolean)
+      default: "input_boolean.brandalarm_status"
+      selector:
+        entity:
+          domain: input_boolean
+
+    # --- POSITIONEN ---
+    max_oeffnung:
+      name: Maximale Öffnungsposition (%)
+      default: 94
+      selector:
+        number: {min: 0, max: 100, unit_of_measurement: "%"}
+    beschattung_pos_morgens:
+      name: Beschattungsposition VORMITTAGS (%)
+      default: 60
+      selector:
+        number: {min: 0, max: 100, unit_of_measurement: "%"}
+    beschattung_pos_nachmittags:
+      name: Beschattungsposition NACHMITTAGS (%)
+      default: 60
+      selector:
+        number: {min: 0, max: 100, unit_of_measurement: "%"}
+    beschattung_wechsel_zeit:
+      name: Wechselzeit für Beschattung
+      default: "13:00:00"
+      description: "Ab wann soll die Nachmittags-Position gelten?"
+      selector:
+        time: {}
+    lueftungs_pos:
+      name: Lüftungsposition (Kippstellung) (%)
+      default: 15
+      selector:
+        number: {min: 0, max: 100, unit_of_measurement: "%"}
+    durchgangs_pos:
+      name: "Durchgangsposition (bei aktiver Beschattung) (%)"
+      default: 80
+      description: >
+        Wie weit soll das Rollo hochfahren, wenn das Fenster/die Tür GANZ geöffnet wird,
+        WÄHREND Beschattung oder Extrem-Hitzeschutz aktiv ist?
+        Ist kein Sonnenstands-Modus aktiv (nachts, morgens, bewölkt), fährt das Rollo
+        stattdessen auf die "Maximale Öffnungsposition".
+      selector:
+        number: {min: 0, max: 100, unit_of_measurement: "%"}
+
+    # --- TEMPERATUR SCHWELLEN ---
+    raumtemp_max_schwelle:
+      name: Sonnenschutz-Schwelle Innen
+      default: 23.5
+      selector:
+        number: {min: 18, max: 30, step: 0.1, unit_of_measurement: "°C"}
+    aussentemp_schwelle:
+      name: Sonnenschutz-Schwelle Außen
+      default: 25.0
+      selector:
+        number: {min: 10, max: 40, step: 0.5, unit_of_measurement: "°C"}
+    raumtemp_min_schwelle:
+      name: Winter-Sperre (Minimum)
+      default: 21.0
+      selector:
+        number: {min: 15, max: 25, step: 0.5, unit_of_measurement: "°C"}
+
+    # --- EXTREM-HITZESCHUTZ ---
+    hitze_extrem_innen_ein:
+      name: "Extrem-Hitzeschutz: Innen-Schwelle EIN (°C)"
+      default: 25.0
+      description: "Rollo fährt auf Extrem-Position wenn Innentemperatur diese Schwelle überschreitet."
+      selector:
+        number: {min: 20, max: 35, step: 0.5, unit_of_measurement: "°C"}
+    hitze_extrem_innen_aus:
+      name: "Extrem-Hitzeschutz: Innen-Schwelle AUS (°C)"
+      default: 23.5
+      description: "Rollo kehrt zur normalen Beschattung zurück wenn Innentemperatur unter diese Schwelle fällt (Hysterese)."
+      selector:
+        number: {min: 18, max: 33, step: 0.5, unit_of_measurement: "°C"}
+    hitze_extrem_aussen_ein:
+      name: "Extrem-Hitzeschutz: Außen-Schwelle EIN (°C)"
+      default: 28.0
+      description: "Extrem-Hitzeschutz greift nur wenn auch die Außentemperatur diese Schwelle überschreitet."
+      selector:
+        number: {min: 20, max: 45, step: 0.5, unit_of_measurement: "°C"}
+    hitze_extrem_aussen_aus:
+      name: "Extrem-Hitzeschutz: Außen-Schwelle AUS (°C)"
+      default: 26.0
+      description: "Außen-Hysterese: Extrem-Modus endet wenn Außentemperatur unter diese Schwelle fällt."
+      selector:
+        number: {min: 18, max: 43, step: 0.5, unit_of_measurement: "°C"}
+    hitze_extrem_pos:
+      name: "Extrem-Hitzeschutz: Rollo-Position (%)"
+      default: 10
+      description: "Position bei extremer Hitze – deutlich weiter geschlossen als normale Beschattung."
+      selector:
+        number: {min: 0, max: 50, unit_of_measurement: "%"}
+
+    zeit_oeffnen_sperre:
+      name: Ende der Morgen-Öffnung
+      default: "11:00:00"
+      selector:
+        time: {}
+
+    notify_handy:
+      name: Handy Benachrichtigungs-Dienst
+      default: ""
+    notify_block_active:
+      name: Blockade-Benachrichtigung aktivieren?
+      default: false
+      selector:
+        boolean: {}
+    pause_timer:
+      name: Benachrichtigungs-Pause Timer
+      default: ""
+      selector:
+        entity:
+          domain: timer
+    zeit_kontrolle:
+      name: Sicherheits-Check Abends
+      default: "22:00:00"
+
+    pv_sensor:
+      name: PV-Leistungssensor (Watt oder kW)
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+    pv_schwelle:
+      name: PV-Leistungsschwelle (Watt)
+      default: 2000
+      selector:
+        number: {min: 100, max: 10000, step: 100}
+    lux_sensor:
+      name: Helligkeitssensor (Lux)
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+          device_class: illuminance
+    lux_schwelle:
+      name: Helligkeitsschwelle (Lux)
+      default: 25000
+      selector:
+        number: {min: 1000, max: 100000, step: 1000}
+    weather_entity:
+      name: Wetter Entität
+      selector:
+        entity:
+          domain: weather
+
+    raumtemp_sensor:
+      name: Raumtemperatur Sensor
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+    aussentemp_sensor:
+      name: Außentemperatur Sensor
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+    trend_sensor:
+      name: Trend Sensor (optional)
+      default: ""
+      selector:
+        entity:
+          domain: [binary_sensor, ""]
+
+    praesenz_sensor:
+      name: Präsenzmelder (Mehrfachauswahl möglich)
+      default: []
+      selector:
+        entity:
+          domain: binary_sensor
+          multiple: true
+
+    hausmodus_entity:
+      name: Hausmodus (Input Select)
+      selector:
+        entity:
+          domain: input_select
+
+    workday_sensor:
+      name: Workday Sensor (Feiertage, optional)
+      default: ""
+      description: >
+        Binary Sensor der Workday-Integration. "off" = Wochenende ODER Feiertag ->
+        es gilt die späte Öffnungszeit (WE/Urlaub).
+        Leer lassen = Fallback auf reine Wochentagsprüfung (Mo-Fr = Werktag, Feiertage
+        werden dann NICHT erkannt).
+      selector:
+        entity:
+          domain: binary_sensor
+
+    # --- SPLIT FENSTER SENSOREN ---
+    fenster_ganz_offen:
+      name: "Fenster-Sensor: Ganz offen (Durchgang / Querlüften)"
+      description: >
+        Fährt das Rollo GANZ AUF (Maximale Öffnungsposition) – auch nachts, vor der
+        Morgen-Öffnungszeit und aus manuell geschlossenem Zustand heraus.
+        Ist Beschattung oder Extrem-Hitzeschutz aktiv, wird nur die Durchgangsposition angefahren.
+        Leer lassen bei Fenstern, die nie ganz geöffnet werden.
+      default: []
+      selector:
+        entity:
+          domain: binary_sensor
+          multiple: true
+    fenster_lueftung:
+      name: "Fenster-Sensor: Lüftung (Kippstellung)"
+      description: "Fährt das Rollo nur in die Lüftungsposition. Schließt abends automatisch auf diese Höhe."
+      default: []
+      selector:
+        entity:
+          domain: binary_sensor
+          multiple: true
+
+    zeit_fruehestens:
+      name: Früheste Öffnung (Mo-Fr)
+      default: "06:30:00"
+    sonnenaufgang_woche:
+      name: Auf Sonnenaufgang warten (Mo-Fr)
+      default: true
+      selector:
+        boolean: {}
+    zeit_we_fruehestens:
+      name: Früheste Öffnung (WE/Urlaub)
+      default: "08:00:00"
+    zeit_spaetestens:
+      name: Spätestens Öffnen
+      default: "09:30:00"
+    sunset_offset:
+      name: Verzögerung nach Sonnenuntergang (Minuten)
+      default: 30
+      selector:
+        number: {min: -60, max: 120, unit_of_measurement: "min"}
+
+mode: restart
+
+trigger:
+  - platform: state
+    entity_id: !input fenster_ganz_offen
+    id: "sperre_event"
+  - platform: state
+    entity_id: !input fenster_lueftung
+    id: "lueftung_event"
+  - platform: state
+    entity_id: !input praesenz_sensor
+    to: "on"
+    id: "praesenz_event"
+  - platform: state
+    entity_id: !input pv_sensor
+    for:
+      minutes: 2
+    id: "pv_change"
+  - platform: sun
+    event: sunset
+    id: "sunset_event"
+  - platform: time
+    at: !input zeit_spaetestens
+    id: "morgens_max"
+  - platform: time
+    at: !input zeit_kontrolle
+    id: "check_abends"
+  - platform: state
+    entity_id: !input hausmodus_entity
+  - platform: time_pattern
+    minutes: "/15"
+    id: "stunden_check"
+
+variables:
+  v_rollo: !input rollo_entity
+  v_fire_ent: !input brandalarm_entity
+  v_max_pos_raw: !input max_oeffnung
+  v_schat_m_raw: !input beschattung_pos_morgens
+  v_schat_n_raw: !input beschattung_pos_nachmittags
+  v_wechsel_zeit: !input beschattung_wechsel_zeit
+  v_lueftung_raw: !input lueftungs_pos
+  v_durchgang_raw: !input durchgangs_pos
+  v_fenster_sperre: !input fenster_ganz_offen
+  v_fenster_lueftung: !input fenster_lueftung
+  v_praesenz_raw: !input praesenz_sensor
+  v_praesenz: "{{ [v_praesenz_raw] if v_praesenz_raw is string else v_praesenz_raw }}"
+  v_modus_ent: !input hausmodus_entity
+  v_workday_ent: !input workday_sensor
+  v_pv_ent: !input pv_sensor
+  v_pv_limit: !input pv_schwelle
+  v_lux_ent: !input lux_sensor
+  v_lux_limit: !input lux_schwelle
+  v_weather: !input weather_entity
+  v_raum_ent: !input raumtemp_sensor
+  v_aussen_ent: !input aussentemp_sensor
+  v_trend_ent: !input trend_sensor
+  v_richtung: !input himmelsrichtung
+  v_raum_max: !input raumtemp_max_schwelle
+  v_aussen_limit: !input aussentemp_schwelle
+  v_raum_min: !input raumtemp_min_schwelle
+
+  # --- Extrem-Hitzeschutz Variablen ---
+  v_extrem_innen_ein: !input hitze_extrem_innen_ein
+  v_extrem_innen_aus: !input hitze_extrem_innen_aus
+  v_extrem_aussen_ein: !input hitze_extrem_aussen_ein
+  v_extrem_aussen_aus: !input hitze_extrem_aussen_aus
+  v_extrem_pos_raw: !input hitze_extrem_pos
+
+  v_zeit_werk: !input zeit_fruehestens
+  v_sonne_woche: !input sonnenaufgang_woche
+  v_zeit_we: !input zeit_we_fruehestens
+  v_zeit_max: !input zeit_spaetestens
+  v_zeit_sperre: !input zeit_oeffnen_sperre
+  v_handy_in: !input notify_handy
+  v_timer: !input pause_timer
+  v_sunset_offset: !input sunset_offset
+
+  v_notify_block_raw: !input notify_block_active
+  v_notify_block: "{{ v_notify_block_raw | string | lower in ['true', 'on', '1'] }}"
+
+  v_max_pos: "{{ v_max_pos_raw | int(94) }}"
+  v_lueftung: "{{ v_lueftung_raw | int(0) }}"
+  v_durchgang: "{{ v_durchgang_raw | int(94) }}"
+  v_extrem_pos: "{{ v_extrem_pos_raw | int(10) }}"
+
+  v_schatten_pos: >
+    {% if now() < today_at(v_wechsel_zeit | trim) %}
+      {{ v_schat_m_raw | int(60) }}
+    {% else %}
+      {{ v_schat_n_raw | int(60) }}
+    {% endif %}
+
+  v_pv_watt: >
+    {% set raw_val = states(v_pv_ent) | float(0) if v_pv_ent != '' else 0 %}
+    {% set unit = state_attr(v_pv_ent, 'unit_of_measurement') | default('W') | string | lower %}
+    {{ raw_val * 1000 if unit == 'kw' else raw_val }}
+
+  v_lux_val: "{{ states(v_lux_ent) | float(0) if v_lux_ent != '' else 0 }}"
+  v_name: "{{ state_attr(v_rollo, 'friendly_name') | default('Rollo') }}"
+  aktuelle_pos: "{{ state_attr(v_rollo, 'current_position') | int(-1) }}"
+
+  sperrschutz: "{{ expand(v_fenster_sperre) | selectattr('state', 'eq', 'on') | list | length > 0 }}"
+  lueftung_aktiv: "{{ expand(v_fenster_lueftung) | selectattr('state', 'eq', 'on') | list | length > 0 }}"
+
+  motor_laeuft: "{{ is_state(v_rollo, 'opening') or is_state(v_rollo, 'closing') }}"
+
+  ist_hell: "{{ is_state('sun.sun', 'above_horizon') }}"
+  ist_nacht: "{{ is_state('sun.sun', 'below_horizon') }}"
+  pause_aktiv: "{{ is_state(v_timer, 'active') if v_timer != '' else false }}"
+
+  # --- V84: Werktag-Erkennung inkl. Feiertage ---
+  # Workday-Sensor ist an Wochenenden UND Feiertagen "off".
+  # Faellt der Sensor aus (unavailable/unknown) oder ist er leer -> Fallback Mo-Fr.
+  ist_werktag: >
+    {% if v_workday_ent != '' and states(v_workday_ent) in ['on', 'off'] %}
+      {{ is_state(v_workday_ent, 'on') }}
+    {% else %}
+      {{ now().weekday() < 5 }}
+    {% endif %}
+
+  # Spaete Oeffnungszeit gilt bei: Wochenende, Feiertag ODER Hausmodus Urlaub.
+  # Hausmodus "Abwesend" bewusst NICHT hier: der wirkt ueber startschuss
+  # (oeffnet ohne Praesenz ab der fruehesten Zeit, spaetestens zu zeit_spaetestens).
+  ist_freizeit: "{{ not ist_werktag or states(v_modus_ent) == 'Urlaub' }}"
+  zeit_limit_str: "{% if ist_freizeit %}{{ v_zeit_we }}{% else %}{{ v_zeit_werk }}{% endif %}"
+
+  morgens_erlaubt: >
+    {% set muss_hell_sein = true if ist_freizeit else v_sonne_woche %}
+    {% set helligkeits_check = ist_hell if muss_hell_sein else true %}
+    {{ (now() >= today_at(zeit_limit_str | trim) and helligkeits_check) or (now() >= today_at(v_zeit_max | trim)) }}
+
+  startschuss: >
+    {% set praesenz_aktiv = expand(v_praesenz) | selectattr('state', 'eq', 'on') | list | length > 0 %}
+    {{ (praesenz_aktiv and morgens_erlaubt) or (now() >= today_at(v_zeit_max | trim)) or (states(v_modus_ent) in ['Urlaub', 'Abwesend'] and morgens_erlaubt) }}
+
+  is_manual_override: >
+    {% set pos = aktuelle_pos | int %}
+    {% set max = v_max_pos | int %}
+    {% set schat_m = v_schat_m_raw | int %}
+    {% set schat_n = v_schat_n_raw | int %}
+    {% set lueft = v_lueftung | int %}
+    {% set durchg = v_durchgang | int %}
+    {% set extrem = v_extrem_pos | int %}
+    {% set is_max = (pos >= max - 2) %}
+    {% set is_schat = (schat_m - 2 <= pos <= schat_m + 2) or (schat_n - 2 <= pos <= schat_n + 2) %}
+    {% set is_lueft = (lueft - 2 <= pos <= lueft + 2) %}
+    {% set is_durchg = (durchg - 2 <= pos <= durchg + 2) %}
+    {% set is_extrem = (extrem - 2 <= pos <= extrem + 2) %}
+    {% set is_closed = (pos <= 5) %}
+    {% set is_late = now() > today_at(v_zeit_sperre | trim) %}
+    {% set manual_closed = is_closed and is_late and trigger.id != 'morgens_max' %}
+    {{ not (is_max or is_schat or is_lueft or is_durchg or is_extrem or is_closed) or manual_closed }}
+
+  # --- FIX V84: sonne_auf_f MUSS vor hitze_alarm / hitze_extrem definiert sein ---
+  # HA rendert Variablen der Reihe nach. Vorher stand sonne_auf_f am Ende und war
+  # innerhalb von hitze_extrem undefined -> Extrem-Hitzeschutz griff nicht zuverlaessig.
+  sonne_auf_f: >
+    {% set mapping = {"Nord (315-45)": [315, 45], "Nordost (0-90)": [0, 90], "Ost (45-135)": [45, 135], "Südost (90-180)": [90, 180], "Süd (135-225)": [135, 225], "Süd-Terrasse (100-245)": [100, 245], "Südwest (180-270)": [180, 270], "West (225-330)": [225, 330], "West Kinderzimmer (215-335)": [215, 335], "Nordwest (270-360)": [270, 360]} %}
+    {% set az_range = mapping[v_richtung] %}
+    {% set az = state_attr('sun.sun', 'azimuth') | float(0) %}
+    {% set el = state_attr('sun.sun', 'elevation') | float(0) %}
+    {% if v_richtung == 'Nord (315-45)' %}{{ (az >= 315 or az <= 45) and el > 5 }}{% else %}{{ az >= az_range[0] and az <= az_range[1] and el > 5 }}{% endif %}
+
+  hitze_alarm: >
+    {% set t_in = states(v_raum_ent) | float(0) %}
+    {% set t_out = states(v_aussen_ent) | float(0) %}
+    {% set trend = is_state(v_trend_ent, 'on') if v_trend_ent != '' else false %}
+    {% set is_active = aktuelle_pos <= (v_schatten_pos | int) %}
+    {% if t_in >= v_raum_min %}
+      {% if is_active %}{{ t_in >= (v_raum_max - 1.0) or trend or t_out >= (v_aussen_limit - 1.0) }}
+      {% else %}{{ t_in >= v_raum_max or trend or t_out >= v_aussen_limit }}{% endif %}
+    {% else %} false {% endif %}
+
+  # --- Extrem-Hitzeschutz mit Hysterese ---
+  # EIN: Innen >= v_extrem_innen_ein UND Aussen >= v_extrem_aussen_ein UND Sonne auf Fassade
+  # AUS: Innen < v_extrem_innen_aus ODER Aussen < v_extrem_aussen_aus (Hysterese)
+  hitze_extrem: >
+    {% set t_in = states(v_raum_ent) | float(0) %}
+    {% set t_out = states(v_aussen_ent) | float(0) %}
+    {% set pos = aktuelle_pos | int %}
+    {% set extrem = v_extrem_pos | int %}
+    {% set bereits_extrem = (extrem - 2 <= pos <= extrem + 2) %}
+    {% if bereits_extrem %}
+      {{ t_in >= v_extrem_innen_aus and t_out >= v_extrem_aussen_aus and sonne_auf_f }}
+    {% else %}
+      {{ t_in >= v_extrem_innen_ein and t_out >= v_extrem_aussen_ein and sonne_auf_f }}
+    {% endif %}
+
+  # --- NEU V84: Ist genug Sonne/Licht da, um Beschattung zu rechtfertigen? ---
+  sonne_stark: >
+    {% set pv_tot = v_pv_ent == '' or states(v_pv_ent) in ['unavailable', 'unknown', 'none'] %}
+    {% set lux_tot = v_lux_ent == '' or states(v_lux_ent) in ['unavailable', 'unknown', 'none'] %}
+    {% set w_sonnig = states(v_weather) in ['sunny', 'clear-night', 'partlycloudy'] %}
+    {% set pv_hell = not pv_tot and v_pv_watt > v_pv_limit %}
+    {% set pv_knallt = not pv_tot and v_pv_watt > (v_pv_limit * 2.0) %}
+    {% set lux_hell = not lux_tot and v_lux_val > v_lux_limit %}
+    {% set lux_knallt = not lux_tot and v_lux_val > (v_lux_limit * 1.5) %}
+    {% set failover = pv_tot and lux_tot and w_sonnig %}
+    {{ (pv_hell and (w_sonnig or pv_knallt)) or (lux_hell and (w_sonnig or lux_knallt)) or failover }}
+
+  # --- NEU V84: "Sonnenstands-Modus" aktiv? Entscheidet ueber Durchgang vs. Ganz auf ---
+  beschattung_aktiv: >
+    {{ sonne_auf_f and (hitze_extrem or (hitze_alarm and sonne_stark)) }}
+
+action:
+  - choose:
+      # --- 0. BRANDALARM (oberste Prioritaet) ---
+      # Blueprint haelt still. Das Hochfahren der Rollos auf 100 % uebernimmt die
+      # separate Automatisierung "Sicherheit: BRANDALARM (Rauch/Hitze)".
+      - conditions:
+          - condition: template
+            value_template: "{{ is_state(v_fire_ent, 'on') }}"
+        sequence:
+          - stop: "Brandalarm aktiv - Alle Fahrten blockiert"
+
+      # --- 1a. DURCHGANG / QUERLÜFTEN (Fenster ganz offen) ---
+      # NEU V84:
+      #   Beschattung/Hitzeschutz aktiv -> nur Durchgangsposition
+      #   sonst (nachts, morgens vor Öffnungszeit, manuell zu, bewölkt) -> GANZ AUF
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'sperre_event' and sperrschutz }}"
+        sequence:
+          - variables:
+              ziel_pos: "{{ (v_durchgang | int) if beschattung_aktiv else (v_max_pos | int) }}"
+          - if: "{{ aktuelle_pos | int < ziel_pos | int }}"
+            then:
+              - service: cover.set_cover_position
+                data: { position: "{{ ziel_pos }}" }
+                target: { entity_id: !input rollo_entity }
+
+      # --- 1b. LÜFTUNG (Nur auf Kipp) ---
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'lueftung_event' and lueftung_aktiv and not sperrschutz }}"
+        sequence:
+          - if: "{{ aktuelle_pos | int < v_lueftung | int }}"
+            then:
+              - service: cover.set_cover_position
+                data: { position: "{{ v_lueftung }}" }
+                target: { entity_id: !input rollo_entity }
+
+      # --- 2. ABEND-CHECK ---
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id == 'check_abends' and sperrschutz }}"
+        sequence:
+          - if: "{{ v_handy_in != '' }}"
+            then:
+              - service: "notify.{{ v_handy_in }}"
+                data: { title: "Sicherheits-Check", message: "Das Rollo {{ v_name }} ist blockiert (Fenster ganz offen)!" }
+
+      # --- 3. SCHLIESSEN ---
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ (ist_nacht and not sperrschutz) or
+                 (trigger.id | default('manual') in ['lueftung_event', 'sperre_event'] and not lueftung_aktiv and not sperrschutz and not morgens_erlaubt) }}
+        sequence:
+          - if: "{{ trigger.id == 'sunset_event' }}"
+            then:
+              - delay:
+                  minutes: "{{ v_sunset_offset | int }}"
+          - if: "{{ aktuelle_pos > 0 }}"
+            then:
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ expand(v_fenster_lueftung) | selectattr('state', 'eq', 'on') | list | length > 0 }}"
+                    sequence:
+                      - service: cover.set_cover_position
+                        data: { position: "{{ v_lueftung }}" }
+                        target: { entity_id: !input rollo_entity }
+                default:
+                  - service: cover.close_cover
+                    target: { entity_id: !input rollo_entity }
+
+      # --- 4. TAG-LOGIK (Beschattung & Auffahren) ---
+      - conditions:
+          - condition: template
+            value_template: "{{ not ist_nacht and (startschuss or trigger.id | default('manual') in ['manual', 'lueftung_event', 'sperre_event']) and not motor_laeuft }}"
+        sequence:
+          - choose:
+              # --- 4a. EXTREM-HITZESCHUTZ (hoechste Prioritaet in der Tag-Logik) ---
+              - conditions:
+                  - condition: template
+                    value_template: "{{ hitze_extrem and not sperrschutz and not is_manual_override }}"
+                sequence:
+                  - if: "{{ aktuelle_pos | int != v_extrem_pos | int }}"
+                    then:
+                      - service: cover.set_cover_position
+                        data: { position: "{{ v_extrem_pos }}" }
+                        target: { entity_id: !input rollo_entity }
+
+              # --- 4b. NORMALE BESCHATTUNG ---
+              - conditions:
+                  - condition: template
+                    value_template: "{{ sonne_auf_f and hitze_alarm and sonne_stark and not hitze_extrem }}"
+                sequence:
+                  - if: "{{ not sperrschutz and not is_manual_override and (aktuelle_pos | int > v_schatten_pos | int or aktuelle_pos | int <= 5 or aktuelle_pos | int == v_schat_m_raw | int or aktuelle_pos | int == v_schat_n_raw | int) }}"
+                    then:
+                      - service: cover.set_cover_position
+                        data: { position: "{{ v_schatten_pos }}" }
+                        target: { entity_id: !input rollo_entity }
+
+              # --- 4c. AUFFAHREN (kein Sonnenschutz noetig) ---
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {% set pv_tot = v_pv_ent == '' or states(v_pv_ent) in ['unavailable', 'unknown', 'none'] %}
+                      {% set lux_tot = v_lux_ent == '' or states(v_lux_ent) in ['unavailable', 'unknown', 'none'] %}
+                      {% set w_schlecht = states(v_weather) not in ['sunny', 'clear-night', 'partlycloudy'] %}
+                      {% set pv_aus = not pv_tot and v_pv_watt < (v_pv_limit - 500) %}
+                      {% set lux_aus = not lux_tot and v_lux_val < (v_lux_limit - 5000) %}
+                      {% set failover = pv_tot and lux_tot and w_schlecht %}
+                      {% set sensor_aus = (not pv_tot and pv_aus) or (not lux_tot and lux_aus) %}
+                      {{ (not sonne_auf_f or not hitze_alarm or failover or sensor_aus or aktuelle_pos <= 5) and not hitze_extrem }}
+                sequence:
+                  - if: "{{ not sperrschutz and not lueftung_aktiv and not is_manual_override and aktuelle_pos | int < v_max_pos | int }}"
+                    then:
+                      - service: cover.set_cover_position
+                        data: { position: "{{ v_max_pos }}" }
+                        target: { entity_id: !input rollo_entity }
