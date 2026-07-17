@@ -97,6 +97,7 @@ Setup details for all helpers and template sensors are in the [full documentatio
 The full documentation (operating principle, all inputs, helper and template setup, window sensors, fire-alarm coupling, troubleshooting) is available as a PDF: [English](docs/Documentation_EN.pdf) · [Deutsch](docs/Dokumentation_DE.pdf).
 
 ## Changelog
+**V85** – Fix: the PV trigger was a `state` trigger with `for: 2min` and practically never fired on a continuously changing power sensor, because the `for` window restarted on every value change – so shading never reacted to PV power directly, only on the periodic net. Now a `numeric_state` trigger (`above`/`below` `pv_schwelle`, each `for: 2min`), which debounces correctly. Change: safety net (`time_pattern`) tightened from `/15` to `/5` minutes so the fine reopening edge at `pv_schwelle − 500` / `lux_schwelle − 5000` is caught within 5 instead of 15 minutes. `mode: restart` and the position guards still prevent redundant travel.
 
 **V84** – New: fully opened window raises the shutter completely when no sun-position mode is active (also at night, before opening time, from a manually closed state); only walkthrough position while shading is active. Fix: variable order – `sonne_auf_f` is now defined before `hitze_extrem`. New: workday sensor input for holiday detection. New: helper variables to disentangle the brightness logic.
 
@@ -214,6 +215,7 @@ Details zur Einrichtung aller Helfer und Template-Sensoren stehen in der [ausfü
 Die vollständige Dokumentation (Funktionsprinzip, alle Inputs, Helfer- und Template-Anleitung, Fenstersensorik, Brandalarm-Kopplung, Fehlersuche) liegt als PDF vor: [Deutsch](docs/Dokumentation_DE.pdf) · [English](docs/Documentation_EN.pdf).
 
 ## Changelog
+**V85** – Fix: Der PV-Trigger war als `state` mit `for: 2min` definiert und feuerte bei einem sich ständig ändernden Watt-Sensor praktisch nie, da das `for`-Fenster bei jeder Wertänderung neu startete – die Beschattung reagierte dadurch nie direkt auf die PV-Leistung, sondern nur im Zufallstakt. Jetzt `numeric_state` (`above`/`below` `pv_schwelle`, je `for: 2min`), was korrekt entprellt. Änderung: Sicherheitsnetz (`time_pattern`) von `/15` auf `/5` Minuten verkürzt, damit die Öffnungs-Feinkante bei `pv_schwelle − 500` bzw. `lux_schwelle − 5000` binnen maximal 5 statt 15 Minuten erkannt wird. `mode: restart` und die Positions-Guards verhindern weiterhin Mehrfachfahrten.
 
 **V84** – Neu: Ganz geöffnetes Fenster fährt das Rollo ganz auf, wenn kein Sonnenstands-Modus aktiv ist (auch nachts, vor der Öffnungszeit und aus manuell geschlossenem Zustand); bei aktiver Beschattung weiterhin nur bis zur Durchgangsposition. Fix: Variablenreihenfolge – `sonne_auf_f` wird jetzt vor `hitze_extrem` definiert. Neu: Workday-Sensor als Input für Feiertagserkennung. Neu: Hilfsvariablen zur Entzerrung der Helligkeitslogik.
 
