@@ -1,14 +1,24 @@
 blueprint:
-  name: "Master-Rolladensteuerung V84 (Durchgang & Extrem-Hitzeschutz)"
+  name: "Master-Rolladensteuerung V85 (PV-Trigger-Fix & responsivere Nachführung)"
   description: >
-    V84 - Durchgangs-Logik & Bugfix:
-    - NEU: Fenster ganz offen faehrt das Rollo GANZ AUF (max_oeffnung), wenn KEIN
-      Sonnenstands-Modus (Beschattung / Extrem-Hitzeschutz) aktiv ist.
-      Wirkt auch nachts, vor der Morgen-Oeffnungszeit und bei manuell geschlossenem Rollo.
-    - NEU: Bei aktiver Beschattung/Hitzeschutz weiterhin nur bis zur Durchgangsposition.
-    - FIX: Variablen-Reihenfolge - sonne_auf_f wird jetzt VOR hitze_alarm/hitze_extrem
-      definiert (vorher undefined -> Extrem-Hitzeschutz griff nicht zuverlaessig).
-    - NEU: Hilfsvariablen sonne_stark / beschattung_aktiv (entzerrt die Sonnen-Logik).
+    V85 - PV-Trigger-Fix & responsivere Nachführung:
+    - FIX: PV-Trigger war als 'state' mit 'for: 2min' definiert und feuerte bei einem
+      sich staendig aendernden Watt-Sensor praktisch NIE (das for-Fenster startete bei
+      jeder Wertaenderung neu). Jetzt 'numeric_state' (above/below pv_schwelle) mit
+      'for: 2min' -> das for-Fenster laeuft korrekt, solange die Schwelle in derselben
+      Richtung ueberschritten bleibt. Die Beschattung reagiert damit direkt auf die
+      PV-Leistung statt nur im Zufallstakt.
+    - AENDERUNG: Sicherheitsnetz (time_pattern) von /15 auf /5 Minuten verkuerzt. Die
+      Oeffnungs-Feinkante liegt bei (pv_schwelle - 500) bzw. (lux_schwelle - 5000), also
+      UNTERHALB der Trigger-Schwelle; diese faengt weiterhin das Netz ab - mit /5 nun
+      binnen max. 5 statt 15 Minuten. mode:restart + Positions-Guards verhindern
+      Mehrfachfahrten.
+    - V84: Durchgangs-Logik & Bugfix: Fenster ganz offen faehrt das Rollo GANZ AUF
+      (max_oeffnung), wenn KEIN Sonnenstands-Modus (Beschattung / Extrem-Hitzeschutz)
+      aktiv ist. Wirkt auch nachts, vor der Morgen-Oeffnungszeit und bei manuell
+      geschlossenem Rollo. Bei aktiver Beschattung/Hitzeschutz weiterhin nur bis zur
+      Durchgangsposition. FIX: Variablen-Reihenfolge - sonne_auf_f wird jetzt VOR
+      hitze_alarm/hitze_extrem definiert. Hilfsvariablen sonne_stark / beschattung_aktiv.
     - Brandalarm bleibt oberste Prioritaet: Blueprint haelt still (stop), das Oeffnen
       uebernimmt die separate Brandalarm-Automatisierung.
     - V83: Extrem-Hitzeschutz mit Hysterese (Innen- und Aussentemperatur).
@@ -283,11 +293,25 @@ trigger:
     entity_id: !input praesenz_sensor
     to: "on"
     id: "praesenz_event"
-  - platform: state
+
+  # --- V85 FIX: PV als numeric_state statt state+for ---
+  # Der alte 'state'-Trigger mit 'for: 2min' feuerte bei einem sich staendig aendernden
+  # Watt-Sensor praktisch nie, weil das for-Fenster bei jeder Wertaenderung neu startete.
+  # 'numeric_state' entprellt korrekt: das for-Fenster laeuft, solange der Schwellwert
+  # in dieselbe Richtung ueberschritten bleibt. Zwei Trigger -> beide Richtungen.
+  - platform: numeric_state
     entity_id: !input pv_sensor
+    above: !input pv_schwelle
     for:
       minutes: 2
     id: "pv_change"
+  - platform: numeric_state
+    entity_id: !input pv_sensor
+    below: !input pv_schwelle
+    for:
+      minutes: 2
+    id: "pv_change"
+
   - platform: sun
     event: sunset
     id: "sunset_event"
@@ -299,8 +323,14 @@ trigger:
     id: "check_abends"
   - platform: state
     entity_id: !input hausmodus_entity
+
+  # --- V85: Sicherheitsnetz 15 -> 5 Min ---
+  # Faengt die Oeffnungs-Feinkante ab: 4c oeffnet erst bei (pv_schwelle - 500) bzw.
+  # (lux_schwelle - 5000), also UNTERHALB der PV-Trigger-Schwelle. Mit /5 wird diese
+  # Kante binnen max. 5 statt 15 Minuten erkannt. mode:restart + Positions-Guards
+  # (if aktuelle_pos != ziel) verhindern Mehrfachfahrten / Flattern.
   - platform: time_pattern
-    minutes: "/15"
+    minutes: "/5"
     id: "stunden_check"
 
 variables:
