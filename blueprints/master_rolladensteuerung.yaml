@@ -1,7 +1,22 @@
 blueprint:
-  name: "Master-Rolladensteuerung V85 (PV-Trigger-Fix & responsivere Nachführung)"
+  name: "Master-Rolladensteuerung V86 (Kipp-Fenster blockiert Auffahren nicht mehr)"
   description: >
-    V85 - PV-Trigger-Fix & responsivere Nachführung:
+    V86 - Kipplueftung blockiert das Auffahren nicht mehr:
+    - FIX: Block 4c (AUFFAHREN) hatte die Bedingung 'not lueftung_aktiv'. Damit war das
+      Hochfahren komplett gesperrt, solange ein Fenster auf Kipp stand - und zwar
+      dauerhaft, nicht nur waehrend der Beschattung. Folge: Bei gekipptem Fenster fuhr
+      das Rollo ueber 4a/4b sauber in die Beschattungs- bzw. Extrem-Position, kam nach
+      Ende der Sonnenstandsfahrt aber NIE wieder hoch. Die Bedingung ist entfernt.
+    - BEGRUENDUNG: Die Lueftungsposition ist im restlichen Blueprint konsequent als
+      MINDESTHOEHE modelliert, nicht als Fixposition - Block 1b faehrt nur hoch, wenn
+      aktuelle_pos < v_lueftung, Block 3 schliesst abends nur BIS v_lueftung statt ganz
+      zu. Auch 4a/4b pruefen lueftung_aktiv nicht. Nur 4c behandelte sie faelschlich als
+      Obergrenze. Ein gekipptes Fenster ist kein Grund, das Rollo unten zu halten.
+    - UNVERAENDERT: 'sperrschutz' (Fenster ganz offen) bleibt in 4c enthalten - dort
+      greift gezielt Block 1a mit max_oeffnung bzw. durchgangs_pos. Block 4 laeuft
+      weiterhin nur bei 'not ist_nacht', die nächtliche Kipp-Logik (Schliessen nur bis
+      Lueftungsposition) bleibt damit unberuehrt in Block 3.
+    - V85: PV-Trigger-Fix & responsivere Nachfuehrung:
     - FIX: PV-Trigger war als 'state' mit 'for: 2min' definiert und feuerte bei einem
       sich staendig aendernden Watt-Sensor praktisch NIE (das for-Fenster startete bei
       jeder Wertaenderung neu). Jetzt 'numeric_state' (above/below pv_schwelle) mit
@@ -618,7 +633,12 @@ action:
                       {% set sensor_aus = (not pv_tot and pv_aus) or (not lux_tot and lux_aus) %}
                       {{ (not sonne_auf_f or not hitze_alarm or failover or sensor_aus or aktuelle_pos <= 5) and not hitze_extrem }}
                 sequence:
-                  - if: "{{ not sperrschutz and not lueftung_aktiv and not is_manual_override and aktuelle_pos | int < v_max_pos | int }}"
+                  # --- FIX V86: 'not lueftung_aktiv' entfernt ---
+                  # Ein gekipptes Fenster ist kein Grund, das Auffahren zu blockieren.
+                  # Die Lueftungsposition ist eine Mindesthoehe (siehe 1b und Block 3),
+                  # keine Obergrenze. Vorher blieb das Rollo nach Ende der
+                  # Sonnenstandsfahrt dauerhaft in der Beschattungsposition haengen.
+                  - if: "{{ not sperrschutz and not is_manual_override and aktuelle_pos | int < v_max_pos | int }}"
                     then:
                       - service: cover.set_cover_position
                         data: { position: "{{ v_max_pos }}" }
