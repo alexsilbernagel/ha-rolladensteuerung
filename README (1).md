@@ -1,0 +1,245 @@
+<a name="top"></a>
+
+**🇬🇧 English | [🇩🇪 Deutsch](#deutsch)**
+
+---
+
+# Master Roller Shutter Control (Home Assistant Blueprint)
+
+A comprehensive blueprint for fully automated control of individual roller shutters in Home Assistant – with sun-position shading, extreme-heat protection, ventilation and walkthrough logic, plus presence and holiday awareness.
+
+> **Note:** One automation is created per shutter from the blueprint. That way each room can have its own facade orientation, temperature thresholds and positions.
+
+## Import
+
+[![Open your Home Assistant instance and show the blueprint import dialog.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fraw.githubusercontent.com%2Falexsilbernagel%2Fha-rolladensteuerung%2Fmain%2Fblueprints%2Fmaster_rolladensteuerung.yaml)
+
+Or manually: **Settings → Automations & Scenes → Blueprints → Import Blueprint** and paste this URL:
+
+```
+https://raw.githubusercontent.com/alexsilbernagel/ha-rolladensteuerung/main/blueprints/master_rolladensteuerung.yaml
+```
+
+## What the blueprint does
+
+It combines six jobs that would otherwise require separate automations:
+
+- **Morning opening** – based on time, sunrise, presence, weekday, public holiday and house mode.
+- **Sun-position shading** – the shutter only lowers when the sun actually hits *this* facade (azimuth window per orientation), it is bright enough (PV power or lux) *and* the temperature justifies it.
+- **Extreme-heat protection** – at very high indoor *and* outdoor temperature the shutter moves to a separate, further-closed position. With hysteresis to prevent flapping.
+- **Ventilation position** – a tilted window keeps the shutter at a defined minimum height.
+- **Walkthrough / cross-ventilation logic** – a fully opened window/patio door raises the shutter, even at night, before opening time and out of a manually closed state.
+- **Evening closing** – after sunset with an adjustable offset, taking open windows into account.
+
+Decisions always follow a fixed **priority chain**: safety beats comfort, comfort beats energy.
+
+| Prio | Branch | Effect |
+|---|---|---|
+| 0 | Fire alarm | holds still (`stop`) so an external escape-route automation is not overwritten |
+| 1a | Walkthrough | window fully open → fully up; only walkthrough position while shading is active |
+| 1b | Ventilation | tilted window → minimum height |
+| 2 | Evening check | push notification if a window is still fully open at night |
+| 3 | Closing | night (sunset + offset) → close (only down to ventilation height if tilted) |
+| 4a | Extreme-heat protection | indoor + outdoor very hot → far-closed position |
+| 4b | Shading | sun on facade + heat + brightness → shading position |
+| 4c | Raising | no sun protection needed → fully up |
+
+## Requirements
+
+**Mandatory**
+
+- A shutter (`cover`) with position support (`set_cover_position` + `current_position` attribute). Pure open/close motors do **not** work.
+- The standard `sun.sun` integration
+- A weather entity (`weather.*`)
+- Indoor and outdoor temperature sensors (`device_class: temperature`)
+- An `input_select` as house mode (options: `Zuhause`, `Abwesend`, `Urlaub`)
+- An `input_boolean` as fire-alarm status
+
+**Optional**
+
+- Window sensors (tilt and/or fully open)
+- Presence sensors
+- PV power sensor and/or illuminance sensor (`device_class: illuminance`)
+- Trend sensor for anticipatory shading
+- Workday sensor for holiday detection
+- Timer for notification pause
+- Notify service (a notify group is recommended)
+
+Setup details for all helpers and template sensors are in the [full documentation](docs/Documentation_EN.pdf).
+
+## Quick start
+
+1. Import the blueprint via the button above.
+2. Create the required helpers (house mode, fire-alarm boolean – see docs).
+3. Create the first automation from the blueprint and fill in all inputs for **one** shutter.
+4. Observe for a sunny day or two and adjust the thresholds.
+5. Only once one shutter runs cleanly, transfer the settings to the rest.
+
+### Recommendations by orientation
+
+| Facade | Shading morning / afternoon | Note |
+|---|---|---|
+| East | 20–30 % / 30 % | Early low sun; in shade during the afternoon |
+| South | 50–65 % / 30–65 % | Roof overhang often helps |
+| West | 60 % / 40 % | **Further closed in the afternoon** – reversing this is the most common misconfiguration |
+| North | – | Shading usually unnecessary, rest still useful |
+
+## Important notes
+
+- **Temperature thresholds** should be at least 2 K apart (e.g. 20 °C / 22.5 °C), otherwise the shutter flaps.
+- **`hitze_alarm` is OR-linked:** a very low outdoor threshold makes the indoor temperature practically irrelevant. Choose deliberately.
+- **The fire-alarm boolean is not reset by the blueprint.** That belongs in a separate, acknowledged reset automation – an example is in the documentation. While the boolean is `on`, all shutter automations are suspended.
+- **Choose positions at least 10 % apart** so the manual-override detection can tell them apart.
+- **Sunset offset – precision:** today's sunset is derived from `next_setting` minus one day. Around the equinoxes sunset shifts by up to ~6 minutes per day, so the calculated night start is off by that much (a little early in autumn, a little late in spring); in midsummer and midwinter the deviation approaches zero. Irrelevant for offsets of 30–60 minutes, worth knowing if you set something very short.
+
+## Documentation
+
+The full documentation (operating principle, all inputs, helper and template setup, window sensors, fire-alarm coupling, troubleshooting) is available as a PDF: [English](docs/Documentation_EN.pdf) · [Deutsch](docs/Dokumentation_DE.pdf).
+
+## Changelog
+
+**V87** – Fix: the configured **sunset offset was effectively dead**. It sat as a `delay` inside branch 3 and only ran when `trigger.id == 'sunset_event'`. Every other trigger — presence sensor, window contact, PV, house mode, safety net — went straight through, and `ist_nacht` was already true the moment the sun dropped below the horizon. Shutters therefore closed within minutes of sunset even with 60 minutes configured. Second, deeper problem: even the sunset path never worked, because the automation runs in `mode: restart` — the pending delay was aborted by the next trigger, since V85 (`/15` → `/5`) after at most 5 minutes, and the restarted run satisfied `ist_nacht` and closed immediately. Solution: the offset now lives in the `ist_nacht` variable instead of a delay, so it applies to *every* trigger and is immune to `mode: restart`. The delay construct in branch 3 was removed without replacement. No new trigger is required — the existing `/5` safety net fires branch 3 as soon as `ist_nacht` flips, so the worst-case imprecision is 5 minutes. **All inputs are unchanged** (`sunset_offset` keeps its key, type, default and selector), so a re-import updates existing automations without any reconfiguration. Branch 4 was deliberately left on `not ist_nacht`: during the new dusk phase (sun down, offset still running) both `ist_hell` and `ist_nacht` are false, and 4c uses that window to raise shutters still parked in a shading position, while manually closed ones stay down via `is_manual_override`.
+
+**V86** – Fix: branch 4c (raising) checked `not lueftung_aktiv`, which blocked raising for as long as a window was tilted – permanently, not just while shading was active. The shutter moved correctly into the shading or extreme-heat position via 4a/4b, but never came back up once the sun-position phase ended. Condition removed: throughout the blueprint the ventilation position is modelled as a minimum height – 1b only raises when the current position is below it, branch 3 closes only down to it in the evening, and 4a/4b do not check it either – not as a ceiling. `sperrschutz` remains in 4c, and since branch 4 only runs during the day, the night-time tilt logic in branch 3 is untouched.
+
+**V85** – Fix: the PV trigger was a `state` trigger with `for: 2min` and practically never fired on a continuously changing power sensor, because the `for` window restarted on every value change – so shading never reacted to PV power directly, only on the periodic net. Now a `numeric_state` trigger (`above`/`below` `pv_schwelle`, each `for: 2min`), which debounces correctly. Change: safety net (`time_pattern`) tightened from `/15` to `/5` minutes so the fine reopening edge at `pv_schwelle − 500` / `lux_schwelle − 5000` is caught within 5 instead of 15 minutes. `mode: restart` and the position guards still prevent redundant travel.
+
+**V84** – New: fully opened window raises the shutter completely when no sun-position mode is active (also at night, before opening time, from a manually closed state); only walkthrough position while shading is active. Fix: variable order – `sonne_auf_f` is now defined before `hitze_extrem`. New: workday sensor input for holiday detection. New: helper variables to disentangle the brightness logic.
+
+**V83** – Extreme-heat protection with a separate position and hysteresis over indoor and outdoor temperature.
+
+**V82** – Anti-flapping: debounced PV trigger, `mode: restart`, 15-minute safety net.
+
+## Contributing
+
+Found a bug or have an idea? Feel free to open an [issue](../../issues) or a pull request.
+
+## License
+
+Released under the [MIT License](LICENSE). Use at your own risk – test the fire-alarm coupling once in full before productive use.
+
+<br>
+
+---
+
+<a name="deutsch"></a>
+
+**[🇬🇧 English](#top) | 🇩🇪 Deutsch**
+
+---
+
+# Master-Rolladensteuerung (Home Assistant Blueprint)
+
+Ein umfassender Blueprint zur vollautomatischen Steuerung einzelner Rollos in Home Assistant – mit Sonnenstandsbeschattung, Extrem-Hitzeschutz, Lüftungs- und Durchgangslogik, Präsenz- und Feiertagserkennung.
+
+> **Hinweis:** Für jedes Rollo wird eine eigene Automatisierung aus dem Blueprint erzeugt. So kann jeder Raum eigene Himmelsrichtungen, Temperaturschwellen und Positionen bekommen.
+
+## Import
+
+[![Open your Home Assistant instance and show the blueprint import dialog.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fraw.githubusercontent.com%2Falexsilbernagel%2Fha-rolladensteuerung%2Fmain%2Fblueprints%2Fmaster_rolladensteuerung.yaml)
+
+Alternativ manuell: **Einstellungen → Automatisierungen & Szenen → Blueprints → Blueprint importieren** und diese URL einfügen:
+
+```
+https://raw.githubusercontent.com/alexsilbernagel/ha-rolladensteuerung/main/blueprints/master_rolladensteuerung.yaml
+```
+
+## Was der Blueprint macht
+
+Er vereint sechs Aufgaben, die man sonst in einzelnen Automatisierungen bauen müsste:
+
+- **Morgendliches Öffnen** – abhängig von Uhrzeit, Sonnenaufgang, Präsenz, Wochentag, Feiertag und Hausmodus.
+- **Sonnenstandsbeschattung** – das Rollo fährt nur herunter, wenn die Sonne tatsächlich auf *diese* Fassade scheint (Azimut-Fenster je Himmelsrichtung), es hell genug ist (PV-Leistung oder Lux) *und* die Temperatur das rechtfertigt.
+- **Extrem-Hitzeschutz** – bei sehr hoher Innen- *und* Außentemperatur fährt das Rollo auf eine separate, weiter geschlossene Position. Mit Hysterese gegen Pendeln.
+- **Lüftungsposition** – gekipptes Fenster hält das Rollo auf einer definierten Mindesthöhe.
+- **Durchgangs- und Querlüftungslogik** – ganz geöffnetes Fenster / Terrassentür fährt das Rollo hoch, auch nachts, vor der Öffnungszeit und aus manuell geschlossenem Zustand.
+- **Abendliches Schließen** – nach Sonnenuntergang mit einstellbarem Versatz, unter Berücksichtigung offener Fenster.
+
+Die Entscheidung fällt immer über eine feste **Prioritätenkette**: Sicherheit schlägt Komfort, Komfort schlägt Energie.
+
+| Prio | Zweig | Wirkung |
+|---|---|---|
+| 0 | Brandalarm | hält still (`stop`), damit eine externe Fluchtweg-Automatisierung nicht überschrieben wird |
+| 1a | Durchgang / Querlüften | Fenster ganz offen → ganz auf, bei aktiver Beschattung nur Durchgangsposition |
+| 1b | Lüftung | gekipptes Fenster → Mindesthöhe |
+| 2 | Abend-Check | Push, falls ein Fenster nachts noch ganz offen steht |
+| 3 | Schließen | Nacht (Sonnenuntergang + Versatz) → schließen (bei Kipp nur bis Lüftungsposition) |
+| 4a | Extrem-Hitzeschutz | Innen + Außen sehr heiß → weit geschlossene Position |
+| 4b | Beschattung | Sonne auf Fassade + Hitze + Helligkeit → Beschattungsposition |
+| 4c | Auffahren | kein Sonnenschutz nötig → ganz auf |
+
+## Voraussetzungen
+
+**Pflicht**
+
+- Ein Rollo (`cover`) mit Positionsunterstützung (`set_cover_position` + Attribut `current_position`). Reine Auf/Zu-Antriebe funktionieren **nicht**.
+- Standard-Integration `sun.sun`
+- Eine Wetterentität (`weather.*`)
+- Raum- und Außentemperatursensor (`device_class: temperature`)
+- `input_select` als Hausmodus (Optionen: `Zuhause`, `Abwesend`, `Urlaub`)
+- `input_boolean` als Brandalarm-Status
+
+**Optional**
+
+- Fenstersensoren (Kipp und/oder ganz offen)
+- Präsenzmelder
+- PV-Leistungssensor und/oder Helligkeitssensor (`device_class: illuminance`)
+- Trend-Sensor für vorausschauende Beschattung
+- Workday-Sensor für Feiertagserkennung
+- Timer für Benachrichtigungspause
+- Notify-Dienst (empfohlen: eine Notify-Gruppe)
+
+Details zur Einrichtung aller Helfer und Template-Sensoren stehen in der [ausführlichen Dokumentation](docs/Dokumentation_DE.pdf).
+
+## Schnellstart
+
+1. Blueprint über den Button oben importieren.
+2. Benötigte Helfer anlegen (Hausmodus, Brandalarm-Boolean – siehe Doku).
+3. Erste Automatisierung aus dem Blueprint erstellen, alle Inputs für **ein** Rollo ausfüllen.
+4. Ein bis zwei sonnige Tage beobachten und die Schwellen justieren.
+5. Erst wenn ein Rollo sauber läuft, die Einstellungen auf die übrigen Rollos übertragen.
+
+### Einstellempfehlungen nach Himmelsrichtung
+
+| Fassade | Beschattung vormittags / nachmittags | Hinweis |
+|---|---|---|
+| Ost | 20–30 % / 30 % | Frühe flache Sonne; nachmittags im Schatten |
+| Süd | 50–65 % / 30–65 % | Dachüberstand hilft oft mit |
+| West | 60 % / 40 % | **Nachmittags weiter zu** – häufigste Fehlkonfiguration ist die umgekehrte Reihenfolge |
+| Nord | – | Beschattung meist überflüssig, Rest trotzdem nützlich |
+
+## Wichtige Hinweise
+
+- **Temperaturschwellen** sollten mindestens 2 K auseinanderliegen (z. B. 20 °C / 22,5 °C), sonst pendelt das Rollo.
+- **`hitze_alarm` ist ODER-verknüpft:** eine sehr niedrig gesetzte Außenschwelle macht die Innentemperatur praktisch wirkungslos. Bewusst wählen.
+- **Der Brandalarm-Boolean wird vom Blueprint nicht zurückgesetzt.** Das gehört in eine eigene, quittierte Reset-Automatisierung – ein Beispiel steht in der Dokumentation. Solange der Boolean `on` ist, sind alle Rollo-Automatisierungen stillgelegt.
+- **Positionen mit mindestens 10 % Abstand** wählen, damit die Override-Erkennung sie unterscheiden kann.
+- **Sonnenuntergangs-Versatz – Genauigkeit:** Der heutige Sonnenuntergang wird aus `next_setting` minus einem Tag abgeleitet. Um die Tagundnachtgleichen verschiebt sich der Sonnenuntergang um bis zu ~6 Minuten pro Tag, der berechnete Nachtbeginn liegt dann entsprechend daneben (im Herbst etwas zu früh, im Frühjahr etwas zu spät); im Hochsommer und Winter geht die Abweichung gegen null. Bei Versätzen von 30–60 Minuten ohne Belang, bei sehr kurzen Werten gut zu wissen.
+
+## Dokumentation
+
+Die vollständige Dokumentation (Funktionsprinzip, alle Inputs, Helfer- und Template-Anleitung, Fenstersensorik, Brandalarm-Kopplung, Fehlersuche) liegt als PDF vor: [Deutsch](docs/Dokumentation_DE.pdf) · [English](docs/Documentation_EN.pdf).
+
+## Changelog
+
+**V87** – Fix: Der eingestellte **Sonnenuntergangs-Versatz war faktisch wirkungslos**. Er lag als `delay` in Block 3 und wurde nur ausgeführt, wenn `trigger.id == 'sunset_event'` war. Jeder andere Trigger – Präsenzmelder, Fensterkontakt, PV, Hausmodus, Sicherheitsnetz – lief ohne Verzögerung durch, und `ist_nacht` war ab Sonnenuntergang sofort wahr. Die Rollos fuhren dadurch binnen Minuten nach Sonnenuntergang zu, obwohl z. B. 60 Minuten eingestellt waren. Zweites, tieferliegendes Problem: Auch der `sunset_event`-Pfad hat nie funktioniert, weil die Automatisierung in `mode: restart` läuft – der laufende `delay` wurde vom nächsten Trigger abgebrochen, seit V85 (`/15` → `/5`) also spätestens nach 5 Minuten, und der Neulauf erfüllte `ist_nacht` und schloss sofort. Lösung: Der Versatz steckt jetzt in der Variable `ist_nacht` statt in einem `delay`. Damit gilt er für *jeden* Trigger und ist gegen `mode: restart` immun. Das `delay`-Konstrukt in Block 3 ist ersatzlos entfallen. Ein zusätzlicher Trigger ist nicht nötig – das bestehende `/5`-Sicherheitsnetz löst Block 3 aus, sobald `ist_nacht` kippt, die maximale Ungenauigkeit beträgt also 5 Minuten. **Alle Inputs sind unverändert** (`sunset_offset` behält Key, Typ, Default und Selector), ein Re-Import aktualisiert bestehende Automatisierungen daher ohne Neukonfiguration. Block 4 bleibt bewusst auf `not ist_nacht`: In der neuen Dämmerungsphase (Sonne unten, Versatz läuft noch) sind `ist_hell` *und* `ist_nacht` false, und 4c nutzt dieses Fenster, um Rollos hochzufahren, die noch in Beschattungsposition stehen. Manuell geschlossene Rollos bleiben über `is_manual_override` unten.
+
+**V86** – Fix: Block 4c (Auffahren) prüfte `not lueftung_aktiv` und sperrte damit das Hochfahren dauerhaft, solange ein Fenster auf Kipp stand – nicht nur während der Beschattung. Das Rollo fuhr über 4a/4b korrekt in die Beschattungs- bzw. Extrem-Position, kam nach Ende der Sonnenstandsfahrt aber nicht wieder hoch. Bedingung entfernt: Die Lüftungsposition ist im gesamten Blueprint als Mindesthöhe modelliert – 1b fährt nur hoch, wenn die aktuelle Position darunter liegt, Block 3 schließt abends nur bis dorthin, und auch 4a/4b prüfen sie nicht –, nicht als Obergrenze. `sperrschutz` bleibt in 4c erhalten, und da Block 4 nur tagsüber läuft, bleibt die nächtliche Kipp-Logik in Block 3 unberührt.
+
+**V85** – Fix: Der PV-Trigger war als `state` mit `for: 2min` definiert und feuerte bei einem sich ständig ändernden Watt-Sensor praktisch nie, da das `for`-Fenster bei jeder Wertänderung neu startete – die Beschattung reagierte dadurch nie direkt auf die PV-Leistung, sondern nur im Zufallstakt. Jetzt `numeric_state` (`above`/`below` `pv_schwelle`, je `for: 2min`), was korrekt entprellt. Änderung: Sicherheitsnetz (`time_pattern`) von `/15` auf `/5` Minuten verkürzt, damit die Öffnungs-Feinkante bei `pv_schwelle − 500` bzw. `lux_schwelle − 5000` binnen maximal 5 statt 15 Minuten erkannt wird. `mode: restart` und die Positions-Guards verhindern weiterhin Mehrfachfahrten.
+
+**V84** – Neu: Ganz geöffnetes Fenster fährt das Rollo ganz auf, wenn kein Sonnenstands-Modus aktiv ist (auch nachts, vor der Öffnungszeit und aus manuell geschlossenem Zustand); bei aktiver Beschattung weiterhin nur bis zur Durchgangsposition. Fix: Variablenreihenfolge – `sonne_auf_f` wird jetzt vor `hitze_extrem` definiert. Neu: Workday-Sensor als Input für Feiertagserkennung. Neu: Hilfsvariablen zur Entzerrung der Helligkeitslogik.
+
+**V83** – Extrem-Hitzeschutz mit separater Position und Hysterese über Innen- und Außentemperatur.
+
+**V82** – Anti-Flapping: PV-Trigger mit Entprellung, `mode: restart`, 15-Minuten-Sicherheitsnetz.
+
+## Mitmachen
+
+Fehler gefunden oder eine Idee? Gerne ein [Issue](../../issues) eröffnen oder einen Pull Request stellen.
+
+## Lizenz
+
+Veröffentlicht unter der [MIT-Lizenz](LICENSE). Nutzung auf eigene Verantwortung – insbesondere die Brandalarm-Kopplung vor dem Produktivbetrieb einmal vollständig durchtesten.
+
+[⬆ nach oben / back to top](#top)
