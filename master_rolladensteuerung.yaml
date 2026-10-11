@@ -1,6 +1,20 @@
 blueprint:
-  name: "Master-Rolladensteuerung V88 (sunset_offset wirkt endlich)"
+  name: "Master-Rolladensteuerung V89 (Winter-Sperre wirkt endlich)"
   description: >
+    V89 - Winter-Sperre wirkt jetzt tatsaechlich:
+    - FIX: hitze_alarm gab unterhalb der Winter-Sperre (raumtemp_min_schwelle) im
+      else-Zweig das nackte Wort 'false' aus. Das ist ein String (" false "), kein
+      Boolean - und jeder nicht-leere String ist truthy. Folge: Unter der Winter-Sperre
+      war hitze_alarm IMMER wahr. Block 4b beschattete bei Sonne auf der Fassade und
+      hoher Helligkeit, Block 4c (Auffahren) war ueber 'not hitze_alarm' gesperrt.
+      Die Winter-Sperre bewirkte also das Gegenteil: gerade an kuehlen Tagen wurde
+      beschattet statt die Sonne zum Heizen zu nutzen. Gleiche Fehlerklasse wie V88.
+    - LOESUNG: hitze_alarm ist jetzt eine einzelne Expression mit echtem Boolean.
+    - ENTFERNT: Inputs 'pause_timer' und 'notify_block_active' sowie die Variablen
+      v_timer, v_notify_block_raw, v_notify_block und pause_aktiv. Sie wurden seit
+      Wegfall der Blockade-Pause nirgends mehr ausgewertet. Bestehende Automatisierungen
+      sollten die beiden Inputs entfernen (sonst meldet HA unbekannte Inputs).
+    V88 - siehe README.
     V87 - Verzoegerung nach Sonnenuntergang wirkt jetzt tatsaechlich:
     - FIX: Der eingestellte sunset_offset war faktisch wirkungslos. Er lag als 'delay'
       in Block 3 und wurde nur ausgefuehrt, wenn trigger.id == 'sunset_event' war.
@@ -63,7 +77,7 @@ blueprint:
     - V83: Extrem-Hitzeschutz mit Hysterese (Innen- und Aussentemperatur).
     - V82: Anti-Flapping Fixes (PV-Trigger 2min, mode restart, time_pattern 15min)
   domain: automation
-  source_url: https://raw.githubusercontent.com/alexsilbernagel/ha-rolladensteuerung/main/blueprints/master_rolladensteuerung.yaml
+  source_url: https://raw.githubusercontent.com/alexsilbernagel/ha-rolladensteuerung/main/master_rolladensteuerung.yaml
   input:
     rollo_entity:
       name: Rollo
@@ -188,17 +202,6 @@ blueprint:
     notify_handy:
       name: Handy Benachrichtigungs-Dienst
       default: ""
-    notify_block_active:
-      name: Blockade-Benachrichtigung aktivieren?
-      default: false
-      selector:
-        boolean: {}
-    pause_timer:
-      name: Benachrichtigungs-Pause Timer
-      default: ""
-      selector:
-        entity:
-          domain: timer
     zeit_kontrolle:
       name: Sicherheits-Check Abends
       default: "22:00:00"
@@ -417,11 +420,8 @@ variables:
   v_zeit_max: !input zeit_spaetestens
   v_zeit_sperre: !input zeit_oeffnen_sperre
   v_handy_in: !input notify_handy
-  v_timer: !input pause_timer
   v_sunset_offset: !input sunset_offset
 
-  v_notify_block_raw: !input notify_block_active
-  v_notify_block: "{{ v_notify_block_raw | string | lower in ['true', 'on', '1'] }}"
 
   v_max_pos: "{{ v_max_pos_raw | int(94) }}"
   v_lueftung: "{{ v_lueftung_raw | int(0) }}"
@@ -478,7 +478,6 @@ variables:
        and now() >= (state_attr('sun.sun', 'next_setting') | as_datetime
                      - timedelta(days=1)
                      + timedelta(minutes=v_sunset_offset | int)) }}
-  pause_aktiv: "{{ is_state(v_timer, 'active') if v_timer != '' else false }}"
 
   # --- V84: Werktag-Erkennung inkl. Feiertage ---
   # Workday-Sensor ist an Wochenenden UND Feiertagen "off".
@@ -533,15 +532,16 @@ variables:
     {% set el = state_attr('sun.sun', 'elevation') | float(0) %}
     {% if v_richtung == 'Nord (315-45)' %}{{ (az >= 315 or az <= 45) and el > 5 }}{% else %}{{ az >= az_range[0] and az <= az_range[1] and el > 5 }}{% endif %}
 
+  # --- FIX V89: Eine Expression statt {% if %}-Block (echter Boolean) ---
+  # Vorher lieferte der else-Zweig den String " false " -> truthy -> unterhalb der
+  # Winter-Sperre war hitze_alarm immer wahr.
   hitze_alarm: >
     {% set t_in = states(v_raum_ent) | float(0) %}
     {% set t_out = states(v_aussen_ent) | float(0) %}
     {% set trend = is_state(v_trend_ent, 'on') if v_trend_ent != '' else false %}
     {% set is_active = aktuelle_pos <= (v_schatten_pos | int) %}
-    {% if t_in >= v_raum_min %}
-      {% if is_active %}{{ t_in >= (v_raum_max - 1.0) or trend or t_out >= (v_aussen_limit - 1.0) }}
-      {% else %}{{ t_in >= v_raum_max or trend or t_out >= v_aussen_limit }}{% endif %}
-    {% else %} false {% endif %}
+    {% set hyst = 1.0 if is_active else 0.0 %}
+    {{ t_in >= v_raum_min and (t_in >= (v_raum_max - hyst) or trend or t_out >= (v_aussen_limit - hyst)) }}
 
   # --- Extrem-Hitzeschutz mit Hysterese ---
   # EIN: Innen >= v_extrem_innen_ein UND Aussen >= v_extrem_aussen_ein UND Sonne auf Fassade

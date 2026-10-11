@@ -62,7 +62,6 @@ Decisions always follow a fixed **priority chain**: safety beats comfort, comfor
 - PV power sensor and/or illuminance sensor (`device_class: illuminance`)
 - Trend sensor for anticipatory shading
 - Workday sensor for holiday detection
-- Timer for notification pause
 - Notify service (a notify group is recommended)
 
 Setup details for all helpers and template sensors are in the [full documentation](docs/Documentation_EN.pdf).
@@ -97,6 +96,8 @@ Setup details for all helpers and template sensors are in the [full documentatio
 The full documentation (operating principle, all inputs, helper and template setup, window sensors, fire-alarm coupling, troubleshooting) is available as a PDF: [English](docs/Documentation_EN.pdf) · [Deutsch](docs/Dokumentation_DE.pdf).
 
 ## Changelog
+
+**V89** – Fix: the **winter lock (`raumtemp_min_schwelle`) worked backwards**. Below the threshold, `hitze_alarm` emitted the bare word `false` from an `{% else %}` branch — the same bug class as V88: a non-empty string, therefore truthy. Below the winter lock `hitze_alarm` was always true, so branch 4b shaded whenever the sun hit the façade and PV/illuminance was high, and branch 4c (raise) was blocked via `not hitze_alarm`. On exactly the cool days when solar gain is wanted, the shutters went into shading. `hitze_alarm` is now a single boolean expression; behaviour above the winter lock (including the 1 °C hysteresis while shading) is unchanged. **Removed:** inputs `pause_timer` and `notify_block_active` plus the unused variables `v_timer`, `v_notify_block_raw`, `v_notify_block` and `pause_aktiv`. **Migration:** remove both inputs from existing automations; the notification-pause timer helper is no longer needed.
 
 **V88** – Fix: V87 shipped a broken `ist_nacht` and **must not be used**. The condition was written as a `{% if %}` / `{% else %}` block that emitted the bare word `false`. A Jinja block does not return a boolean — it renders a multi-line *string* (`"\n  false\n"`), and every non-empty string is truthy. Home Assistant only converts exact Python literals (`False`, capitalised, no surrounding whitespace), so lowercase `false` stayed a string and evaluated as **true**. `ist_nacht` was therefore true around the clock: branch 3 fired at any hour and drove the shutters to the ventilation or closed position in broad daylight, while branch 4 (`not ist_nacht`) never ran at all. Fixed by expressing the condition as a single `and` expression, which returns a real boolean: above the horizon → `False`, below → the time comparison. Lesson for the blueprint in general: any variable used as a condition must be one expression, never an `{% if %}` block.
 
@@ -188,7 +189,6 @@ Die Entscheidung fällt immer über eine feste **Prioritätenkette**: Sicherheit
 - PV-Leistungssensor und/oder Helligkeitssensor (`device_class: illuminance`)
 - Trend-Sensor für vorausschauende Beschattung
 - Workday-Sensor für Feiertagserkennung
-- Timer für Benachrichtigungspause
 - Notify-Dienst (empfohlen: eine Notify-Gruppe)
 
 Details zur Einrichtung aller Helfer und Template-Sensoren stehen in der [ausführlichen Dokumentation](docs/Dokumentation_DE.pdf).
@@ -223,6 +223,8 @@ Details zur Einrichtung aller Helfer und Template-Sensoren stehen in der [ausfü
 Die vollständige Dokumentation (Funktionsprinzip, alle Inputs, Helfer- und Template-Anleitung, Fenstersensorik, Brandalarm-Kopplung, Fehlersuche) liegt als PDF vor: [Deutsch](docs/Dokumentation_DE.pdf) · [English](docs/Documentation_EN.pdf).
 
 ## Changelog
+
+**V89** – Fix: Die **Winter-Sperre (`raumtemp_min_schwelle`) wirkte umgekehrt**. Unterhalb der Schwelle gab `hitze_alarm` im `{% else %}`-Zweig das nackte Wort `false` aus – dieselbe Fehlerklasse wie in V88: ein nicht-leerer String und damit truthy. Unter der Winter-Sperre war `hitze_alarm` deshalb immer wahr: Block 4b beschattete, sobald die Sonne auf der Fassade stand und PV/Helligkeit hoch waren, und Block 4c (Auffahren) war über `not hitze_alarm` gesperrt. Gerade an kühlen Tagen, an denen Sonnenwärme erwünscht ist, fuhren die Rollos also in die Beschattung. `hitze_alarm` ist jetzt eine einzelne Boolean-Expression; oberhalb der Winter-Sperre ist das Verhalten (inkl. 1 °C Hysterese während der Beschattung) unverändert. **Entfernt:** Inputs `pause_timer` und `notify_block_active` sowie die ungenutzten Variablen `v_timer`, `v_notify_block_raw`, `v_notify_block` und `pause_aktiv`. **Migration:** beide Inputs aus bestehenden Automatisierungen entfernen; der Timer-Helfer für die Benachrichtigungspause wird nicht mehr benötigt.
 
 **V88** – Fix: V87 enthielt ein defektes `ist_nacht` und **darf nicht verwendet werden**. Die Bedingung war als `{% if %}` / `{% else %}`-Block geschrieben und gab dort das nackte Wort `false` aus. Ein Jinja-Block liefert aber keinen Boolean, sondern rendert einen mehrzeiligen *String* (`"\n  false\n"`) – und jeder nicht-leere String ist truthy. Home Assistant wandelt nur exakte Python-Literale um (`False`, groß geschrieben, ohne umgebenden Whitespace); kleingeschriebenes `false` blieb damit ein String und wurde als **wahr** gewertet. `ist_nacht` war folglich rund um die Uhr wahr: Block 3 griff zu jeder Tageszeit und fuhr die Rollos bei hellem Tageslicht in die Lüftungs- oder Schließposition, während Block 4 (`not ist_nacht`) überhaupt nicht mehr lief. Behoben durch eine einzelne `and`-Expression, die einen echten Boolean liefert: Sonne über dem Horizont → `False`, darunter → der Zeitvergleich. Generelle Lehre für den Blueprint: Jede Variable, die als Bedingung dient, muss eine Expression sein, niemals ein `{% if %}`-Block.
 
