@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Master-Rolladensteuerung V89 – Dokumentation</title>
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+
+<h1>Master-Rolladensteuerung V89</h1>
+<p class="subtitle">Home Assistant Blueprint – Sonnenstandsbeschattung, Extrem-Hitzeschutz, Lüftungs- und Durchgangslogik</p>
+<p class="meta">Vollständige Dokumentation · Stand Oktober 2026 · Version V89 · Blueprint-Domain: automation</p>
+
+<h2>Inhalt</h2>
+<div class="toc">
+<ol>
+<li>Was der Blueprint macht</li>
+<li>Funktionsprinzip: die Prioritätenkette</li>
+<li>Voraussetzungen und benötigte Entitäten</li>
+<li>Helfer und Template-Sensoren anlegen</li>
+<li>Fenstersensorik: Kippstellung vs. ganz offen</li>
+<li>Installation des Blueprints</li>
+<li>Vollständige Input-Referenz</li>
+<li>Einstellempfehlungen nach Himmelsrichtung</li>
+<li>Der manuelle Override</li>
+<li>Zusammenspiel mit einer Brandalarm-Automatisierung (inkl. quittiertem Reset und Dashboard-Karte)</li>
+<li>Fehlersuche und Debugging</li>
+<li>Bekannte Einschränkungen</li>
+<li>Changelog</li>
+</ol>
+</div>
+
+<h2>1. Was der Blueprint macht</h2>
+<p>Der Blueprint steuert ein einzelnes Rollo vollautomatisch über den Tag. Für jedes Rollo im Haus wird eine eigene Automatisierung aus dem Blueprint erzeugt – so kann jeder Raum eigene Himmelsrichtungen, Temperaturschwellen und Positionen bekommen.</p>
+<p>Er vereint sechs Aufgaben, die man sonst in einzelnen Automatisierungen bauen müsste:</p>
+<ul>
+<li><strong>Morgendliches Öffnen</strong> – abhängig von Uhrzeit, Sonnenaufgang, Präsenz, Wochentag, Feiertag und Hausmodus.</li>
+<li><strong>Sonnenstandsbeschattung</strong> – das Rollo fährt nur dann herunter, wenn die Sonne tatsächlich auf diese Fassade scheint (Azimut-Fenster je Himmelsrichtung), es hell genug ist (PV-Leistung oder Lux) und die Temperatur das rechtfertigt.</li>
+<li><strong>Extrem-Hitzeschutz</strong> – bei sehr hoher Innen- und Außentemperatur fährt das Rollo auf eine separate, deutlich weiter geschlossene Position. Mit Hysterese gegen Pendeln.</li>
+<li><strong>Lüftungsposition</strong> – gekipptes Fenster hält das Rollo auf einer definierten Mindesthöhe.</li>
+<li><strong>Durchgangs- und Querlüftungslogik</strong> – ganz geöffnetes Fenster / Terrassentür fährt das Rollo hoch, damit man weder eingesperrt wird noch von Hand nachhelfen muss.</li>
+<li><strong>Abendliches Schließen</strong> – nach Sonnenuntergang mit einstellbarem Versatz, unter Berücksichtigung offener Fenster.</li>
+</ul>
+<div class="note"><p><strong>Kernidee:</strong> Der Blueprint entscheidet nie nach einer einzelnen Bedingung, sondern nach einer festen Prioritätenkette. Sicherheit schlägt Komfort, Komfort schlägt Energie.</p></div>
+
+<h2>2. Funktionsprinzip: die Prioritätenkette</h2>
+<p>Bei jedem Auslöser durchläuft der Blueprint eine <code>choose</code>-Kette von oben nach unten. Der erste zutreffende Zweig gewinnt, alle weiteren werden übersprungen.</p>
+<table>
+<tr><th style="width:7%">Prio</th><th style="width:22%">Zweig</th><th>Bedingung und Wirkung</th></tr>
+<tr><td>0</td><td>Brandalarm</td><td>Ist der Brandalarm-Boolean <code>on</code>, wird die Ausführung sofort mit <code>stop</code> beendet. Der Blueprint fährt nichts – er hält still, damit er eine externe Brandalarm-Automatisierung (die alle Rollos als Fluchtweg öffnet) nicht wieder zufährt. Siehe Kapitel 10.</td></tr>
+<tr><td>1a</td><td>Durchgang / Querlüften</td><td>Ein Sensor aus <em>Fenster ganz offen</em> meldet <code>on</code>. Das Rollo fährt hoch:<br>• ist keine Beschattung aktiv → auf <code>max_oeffnung</code> (ganz auf)<br>• ist Beschattung oder Extrem-Hitzeschutz aktiv → nur auf <code>durchgangs_pos</code><br>Wirkt auch nachts, vor der Morgen-Öffnungszeit und aus manuell geschlossenem Zustand heraus. Das Rollo wird dabei nie zugefahren, nur hoch.</td></tr>
+<tr><td>1b</td><td>Lüftung (Kipp)</td><td>Ein Sensor aus <em>Fenster Lüftung</em> meldet <code>on</code> und kein Ganz-offen-Sensor ist aktiv. Das Rollo fährt mindestens auf <code>lueftungs_pos</code>, damit der Rollopanzer nicht auf dem gekippten Flügel aufsetzt.</td></tr>
+<tr><td>2</td><td>Abend-Check</td><td>Zur eingestellten Kontrollzeit (Default 22:00) prüft der Blueprint, ob ein Fenster noch ganz offen steht, und schickt eine Push-Nachricht.</td></tr>
+<tr><td>3</td><td>Schließen</td><td>Nacht (Sonnenuntergang plus <code>sunset_offset</code>) und kein Fenster ganz offen → Rollo schließt. Bei gekipptem Fenster wird stattdessen nur bis auf <code>lueftungs_pos</code> geschlossen. Der Versatz steckt seit V87 in der Nacht-Bedingung selbst und gilt damit für jeden Auslöser, nicht nur für den Sonnenuntergangs-Trigger.</td></tr>
+<tr><td>4a</td><td>Extrem-Hitzeschutz</td><td>Sonne auf der Fassade <em>und</em> Innentemperatur über der EIN-Schwelle <em>und</em> Außentemperatur über der EIN-Schwelle → Rollo fährt auf <code>hitze_extrem_pos</code>. Der Modus endet erst, wenn Innen- oder Außentemperatur unter die jeweilige AUS-Schwelle fällt (Hysterese).</td></tr>
+<tr><td>4b</td><td>Normale Beschattung</td><td>Sonne auf der Fassade <em>und</em> Hitze-Alarm <em>und</em> genug Licht (PV oder Lux) → Rollo fährt auf die Beschattungsposition. Vor- und nachmittags getrennt einstellbar.</td></tr>
+<tr><td>4c</td><td>Auffahren</td><td>Kein Sonnenschutz nötig (Sonne weg, bewölkt, kühl) → Rollo fährt auf <code>max_oeffnung</code>. <span class="new">Unterhalb der Winter-Sperre greift dieser Zweig seit V89 zuverlässig – vorher blieb er dort gesperrt.</span></td></tr>
+</table>
+
+<h3>Wann läuft die Automatisierung überhaupt?</h3>
+<p>Auslöser sind: Zustandswechsel der Fenstersensoren, Präsenzmelder, PV-Leistung (mit 2 min Entprellung), Sonnenuntergang, die Zeitpunkte <em>spätestens öffnen</em> und <em>Abend-Check</em>, ein Wechsel des Hausmodus – sowie ein <code>time_pattern</code> alle 5 Minuten als Sicherheitsnetz. Der Modus ist <code>restart</code>: ein neuer Auslöser bricht einen laufenden Durchlauf ab.</p>
+<div class="note"><p>Seit V87 gibt es keinen eigenen Trigger für den Sonnenuntergangs-Versatz. Das Sicherheitsnetz löst den Schließvorgang aus, sobald die Nacht-Bedingung kippt – die maximale Verzögerung beträgt damit 5 Minuten. Ein <code>delay</code> wäre an dieser Stelle wirkungslos, weil <code>mode: restart</code> jeden laufenden Durchlauf beim nächsten Auslöser abbricht.</p></div>
+
+<h3>Die drei Sonnenbedingungen im Detail</h3>
+<ul>
+<li><code>sonne_auf_f</code> – Der Sonnen-Azimut liegt im Winkelbereich der gewählten Himmelsrichtung und die Elevation ist über 5°. Verhindert Beschattung, wenn die Sonne gar nicht auf das Fenster scheint.</li>
+<li><code>sonne_stark</code> – PV-Leistung über der Schwelle oder Lux über der Schwelle, jeweils plausibilisiert mit der Wetterentität. Fällt ein Sensor aus, greift ein Failover allein über das Wetter.</li>
+<li><code>hitze_alarm</code> – Verknüpft ODER: Innentemperatur über der Innenschwelle, oder steigender Temperaturtrend, oder Außentemperatur über der Außenschwelle. Eine Winter-Sperre (<code>raumtemp_min_schwelle</code>) unterdrückt alles, solange es im Raum zu kühl ist. <span class="new">Diese Sperre wirkt erst ab V89 korrekt: Bis V88 war <code>hitze_alarm</code> unterhalb der Winter-Sperre fälschlich immer wahr – siehe Changelog.</span></li>
+</ul>
+<div class="warn"><p><strong>Wichtig zu verstehen:</strong> Weil <code>hitze_alarm</code> eine ODER-Verknüpfung ist, macht eine sehr niedrig gesetzte Außenschwelle (z. B. 10 °C) die Innentemperatur praktisch wirkungslos – ab 10 °C draußen ist die Bedingung im Sommer immer wahr, und es entscheiden nur noch Sonnenstand und Helligkeit. Das kann gewollt sein (»die Sonne blendet mich auch bei 15 °C«), sollte aber eine bewusste Entscheidung sein.</p></div>
+
+<div class="pagebreak"></div>
+<h2>3. Voraussetzungen und benötigte Entitäten</h2>
+<table>
+<tr><th style="width:26%">Was</th><th style="width:9%">Pflicht</th><th>Beschreibung</th></tr>
+<tr><td><code>cover.*</code></td><td>ja</td><td>Rollo mit Positionsunterstützung (<code>set_cover_position</code> und Attribut <code>current_position</code>). Reine Auf/Zu-Rollos funktionieren nicht.</td></tr>
+<tr><td><code>sun.sun</code></td><td>ja</td><td>Standard-Integration. Liefert Azimut und Elevation.</td></tr>
+<tr><td><code>weather.*</code></td><td>ja</td><td>Beliebige Wetterentität. Dient zur Plausibilisierung und als Failover.</td></tr>
+<tr><td>Raumtemperatursensor</td><td>ja</td><td><code>sensor</code> mit <code>device_class: temperature</code>.</td></tr>
+<tr><td>Außentemperatursensor</td><td>ja</td><td>Eigener Sensor oder z. B. OpenWeatherMap.</td></tr>
+<tr><td><code>input_select</code> Hausmodus</td><td>ja</td><td>Helfer mit mindestens den Optionen Zuhause, Abwesend, Urlaub.</td></tr>
+<tr><td><code>input_boolean</code> Brandalarm</td><td>ja</td><td>Wird von der externen Brandalarm-Automatisierung gesetzt.</td></tr>
+<tr><td>Fenstersensor Kipp</td><td>nein</td><td><code>binary_sensor</code>, Mehrfachauswahl möglich.</td></tr>
+<tr><td>Fenstersensor ganz offen</td><td>nein</td><td><code>binary_sensor</code>, Mehrfachauswahl möglich. Leer lassen bei Fenstern, die nie ganz geöffnet werden.</td></tr>
+<tr><td>Präsenzmelder</td><td>nein</td><td>Mehrfachauswahl. Löst den morgendlichen »Startschuss« aus.</td></tr>
+<tr><td>PV-Leistungssensor</td><td>nein</td><td>W oder kW – die Einheit wird automatisch erkannt und umgerechnet.</td></tr>
+<tr><td>Helligkeitssensor</td><td>nein</td><td><code>device_class: illuminance</code>. Pro Fassadenseite ein Sensor ist ideal.</td></tr>
+<tr><td>Trend-Sensor</td><td>nein</td><td><code>binary_sensor</code>, <code>on</code> = Raumtemperatur steigt. Siehe Kapitel 4.</td></tr>
+<tr><td>Workday-Sensor</td><td>nein</td><td>Für Feiertagserkennung. Siehe Kapitel 4.</td></tr>
+<tr><td>Notify-Dienst</td><td>nein</td><td>Empfehlung: eine Notify-Gruppe, siehe Kapitel 4.</td></tr>
+</table>
+<p class="new">Seit V89 entfällt der Timer für die Benachrichtigungspause – der Blueprint hat ihn nicht mehr ausgewertet.</p>
+
+<h2>4. Helfer und Template-Sensoren anlegen</h2>
+
+<h3>4.1 Hausmodus (input_select)</h3>
+<p>Einstellungen → Geräte &amp; Dienste → Helfer → Helfer erstellen → Dropdown. Name: Hausmodus. Optionen exakt so schreiben – der Blueprint vergleicht Textwerte:</p>
+<pre>Zuhause
+Abwesend
+Urlaub</pre>
+<p>Wirkung: <em>Urlaub</em> schaltet auf die späte Öffnungszeit. <em>Abwesend</em> und <em>Urlaub</em> erlauben das Öffnen auch ohne Präsenzmeldung.</p>
+
+<h3>4.2 Brandalarm-Status (input_boolean)</h3>
+<p>Helfer erstellen → Umschalter. Name z. B. Brandalarm Status → Entität <code>input_boolean.brandalarm_status</code>. Dieser Boolean ist die Schnittstelle zwischen Rauchmelder-Automatisierung und Rolladensteuerung.</p>
+
+<h3>4.3 Workday-Sensor (Feiertage)</h3>
+<p>Einstellungen → Geräte &amp; Dienste → Integration hinzufügen → Workday. Land und Bundesland wählen, Wochenende als arbeitsfreie Tage markieren. Ergebnis: <code>binary_sensor.workday_sensor</code>, der an Wochenenden und Feiertagen <code>off</code> ist.</p>
+<p>Der Blueprint nutzt ihn so: <code>off</code> → es gilt die späte Öffnungszeit (WE/Urlaub). Bleibt der Input leer, fällt der Blueprint auf eine reine Wochentagsprüfung zurück – Feiertage werden dann nicht erkannt.</p>
+
+<h3>4.4 Trend-Sensor für die Raumtemperatur</h3>
+<p>Der Trend-Sensor macht die Beschattung vorausschauend: Steigt die Raumtemperatur, wird beschattet, bevor die Schwelle erreicht ist. Anlegen über die Trend-Integration (Einstellungen → Geräte &amp; Dienste → Integration hinzufügen → Trend) oder per YAML:</p>
+<pre>binary_sensor:
+  - platform: trend
+    sensors:
+      temp_wohnzimmer_rollo:
+        friendly_name: "Temp Wohnzimmer steigt"
+        entity_id: sensor.temperatur_wohnzimmer
+        sample_duration: 1800     # 30 Minuten Beobachtungsfenster
+        min_gradient: 0.0005      # ca. +0,9 K/h
+        device_class: heat</pre>
+<p>Pro Raum einen solchen Sensor anlegen und in der jeweiligen Automatisierung eintragen.</p>
+
+<h3>4.5 Notify-Gruppe (empfohlen)</h3>
+<p>Statt in jeder Automatisierung den Gerätedienst einzutragen, sollte eine Notify-Gruppe verwendet werden. Beim Gerätewechsel ändert man dann nur eine Zeile. In der <code>configuration.yaml</code>:</p>
+<pre>notify:
+  - platform: group
+    name: handys
+    services:
+      - service: mobile_app_mein_handy
+      - service: mobile_app_handy_partner     # optional</pre>
+<p>Anschließend Home Assistant neu starten (ein Reload reicht für Notify-Plattformen nicht). Im Blueprint wird dann als <em>Handy Benachrichtigungs-Dienst</em> nur <code>handys</code> eingetragen – der Blueprint baut daraus <code>notify.handys</code>.</p>
+<div class="note"><p>Notify-Gruppen sind Legacy-Dienste und erzeugen keine Entität. Sie tauchen daher nicht unter »Zustände« auf, sondern nur unter Entwicklerwerkzeuge → Aktionen.</p></div>
+
+<h2>5. Fenstersensorik: Kippstellung vs. ganz offen</h2>
+<p>Der Blueprint unterscheidet zwei Fensterzustände, weil sie unterschiedliche Konsequenzen haben:</p>
+<ul>
+<li><strong>Gekippt</strong> → Rollo darf herunter, aber nur bis zur Lüftungsposition (sonst setzt der Panzer auf dem Flügel auf).</li>
+<li><strong>Ganz offen</strong> → Rollo muss hoch (Durchgang, Querlüften, kein Einsperren).</li>
+</ul>
+<p>Ein einzelner Reed-Kontakt kann das nicht unterscheiden – er sieht nur »Flügel bewegt sich vom Rahmen weg«. Es gibt drei praktikable Wege:</p>
+
+<h3>Variante A – Zwei Reed-Kontakte (empfohlen, am robustesten)</h3>
+<p>Ein Kontakt sitzt so, dass er beim Kippen öffnet, ein zweiter so, dass er erst beim vollständigen Öffnen öffnet (typischerweise an der Schließseite des Flügels). Beide Sensoren werden direkt in die jeweiligen Blueprint-Inputs eingetragen – keine Templates nötig. Das ist die Variante mit dem geringsten Fehlerpotenzial.</p>
+
+<h3>Variante B – Griffsensor plus Fensterkontakt</h3>
+<p>Ein Fenstergriffsensor (z. B. Aqara, Bosch) liefert drei Zustände: geschlossen / gekippt / offen. In Kombination mit einem Öffnungskontakt lassen sich beide Zustände per Template-Helfer ableiten:</p>
+<pre>template:
+  - binary_sensor:
+      - name: "Fenster Büro Kippstellung"
+        unique_id: fenster_buero_kippstellung
+        device_class: window
+        state: &gt;
+          {{ is_state('sensor.fenstergriff_buero', 'tilt') }}
+
+      - name: "Fenster Büro ganz geöffnet"
+        unique_id: fenster_buero_ganz_geoeffnet
+        device_class: window
+        state: &gt;
+          {{ is_state('sensor.fenstergriff_buero', 'open') }}</pre>
+<p>Die konkreten Zustandsnamen (<code>open</code>, <code>tilt</code>, <code>closed</code>) hängen vom Gerät und der Integration ab – bitte in den Entwicklerwerkzeugen unter »Zustände« nachsehen.</p>
+
+<h3>Variante C – Fensterkontakt plus separater Griffkontakt</h3>
+<p>Wenn nur ein Öffnungskontakt (<code>A</code>) und ein Kontakt am Griff (<code>B</code>) vorhanden sind, lässt sich die Logik so ableiten:</p>
+<pre>template:
+  - binary_sensor:
+      - name: "Fenster Küche Kippstellung"
+        unique_id: fenster_kueche_kippstellung
+        device_class: window
+        state: &gt;
+          {{ is_state('binary_sensor.fenster_kueche_contact', 'on')
+             and is_state('binary_sensor.griff_kueche_contact', 'on') }}
+
+      - name: "Fenster Küche ganz geöffnet"
+        unique_id: fenster_kueche_ganz_geoeffnet
+        device_class: window
+        state: &gt;
+          {{ is_state('binary_sensor.fenster_kueche_contact', 'on')
+             and is_state('binary_sensor.griff_kueche_contact', 'off') }}</pre>
+<div class="note"><p><strong>Fenster ohne Ganz-offen-Sensor:</strong> Den Input <em>Fenster ganz offen</em> einfach leer lassen. Der Durchgangs-Zweig greift dann für dieses Rollo nie – alles andere funktioniert weiter. Sinnvoll bei Fenstern, die ohnehin nur gekippt werden (Gäste-WC, Kellerfenster).</p></div>
+<div class="warn"><p><strong>Fallstrick:</strong> Wird derselbe Kontakt sowohl als Kipp- als auch als Ganz-offen-Sensor eingetragen, blockiert die Ganz-offen-Logik die Lüftungslogik dauerhaft. Immer nur einen der beiden Inputs pro physischem Sensor belegen.</p></div>
+
+<h2>6. Installation des Blueprints</h2>
+<ol>
+<li>Die YAML-Datei ablegen unter: <code>config/blueprints/automation/&lt;Ordnername&gt;/&lt;Dateiname&gt;.yaml</code></li>
+<li>Entwicklerwerkzeuge → YAML → <em>Automatisierungen</em> neu laden. Bei Änderungen an der <code>configuration.yaml</code> stattdessen einmal komplett neu starten.</li>
+<li>Einstellungen → Automatisierungen &amp; Szenen → Blueprints → den Blueprint auswählen → <em>Automatisierung erstellen</em>.</li>
+<li>Alle Inputs für das erste Rollo ausfüllen, speichern, benennen.</li>
+<li>Für jedes weitere Rollo wiederholen.</li>
+</ol>
+<p>Wird der Blueprint später aktualisiert, genügt es, die Datei zu ersetzen und die Automatisierungen neu zu laden. Die eingetragenen Inputs bleiben erhalten, solange die Input-Namen gleich bleiben. Neue Inputs greifen auf ihren Default zurück. <span class="new">Entfernte Inputs (zuletzt in V89: <code>pause_timer</code> und <code>notify_block_active</code>) sollten aus den bestehenden Automatisierungen gelöscht werden, damit keine Altlasten in der Konfiguration stehen bleiben.</span></p>
+<div class="note"><p>Wird der Blueprint über eine URL importiert (<em>Blueprint erneut importieren</em>), zieht Home Assistant die Datei direkt von der Quelle. Eine lokal ersetzte Datei wird dabei überschrieben – beide Wege also nicht mischen. <span class="new">Seit V89 zeigt die <code>source_url</code> auf den korrekten Pfad im Repo-Root; ein Re-Import funktioniert damit wieder.</span></p></div>
+
+<div class="pagebreak"></div>
+<h2>7. Vollständige Input-Referenz</h2>
+
+<h3>Grundlagen</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Bedeutung</th></tr>
+<tr><td class="k">rollo_entity</td><td>–</td><td>Das zu steuernde Rollo (<code>cover</code>).</td></tr>
+<tr><td class="k">himmelsrichtung</td><td>–</td><td>Azimut-Fenster der Fassade. Bestimmt, wann »die Sonne auf dieses Fenster scheint«. Bei ungewöhnlichen Fassaden die Option wählen, deren Winkelbereich am besten passt.</td></tr>
+<tr><td class="k">brandalarm_entity</td><td class="k">input_boolean.<br>brandalarm_status</td><td>Solange <code>on</code>, führt der Blueprint keinerlei Fahrten aus.</td></tr>
+<tr><td class="k">hausmodus_entity</td><td>–</td><td>Der Hausmodus-Helfer.</td></tr>
+<tr><td class="k">weather_entity</td><td>–</td><td>Wetterentität zur Plausibilisierung.</td></tr>
+</table>
+
+<h3>Positionen (0 % = geschlossen, 100 % = offen)</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Bedeutung</th></tr>
+<tr><td class="k">max_oeffnung</td><td>94</td><td>Normale Offen-Position. Bewusst unter 100 % wählen, wenn der Rollopanzer sonst mechanisch anschlägt oder die Position bei »ganz oben« nicht sauber zurückgemeldet wird.</td></tr>
+<tr><td class="k">beschattung_pos_morgens</td><td>60</td><td>Beschattungsposition vor der Wechselzeit.</td></tr>
+<tr><td class="k">beschattung_pos_nachmittags</td><td>60</td><td>Beschattungsposition nach der Wechselzeit.</td></tr>
+<tr><td class="k">beschattung_wechsel_zeit</td><td>13:00</td><td>Umschaltpunkt zwischen den beiden Beschattungspositionen. Richtwert: der Zeitpunkt, an dem die Sonne die Fassade voll trifft.</td></tr>
+<tr><td class="k">lueftungs_pos</td><td>15</td><td>Mindesthöhe bei gekipptem Fenster. Ausdrücklich eine Untergrenze, keine Fixposition: Steht das Rollo höher, bleibt es stehen.</td></tr>
+<tr><td class="k">durchgangs_pos</td><td>80</td><td>Position bei ganz geöffnetem Fenster, während Beschattung oder Extrem-Hitzeschutz aktiv sind. Ohne aktiven Sonnenschutz fährt das Rollo stattdessen auf <code>max_oeffnung</code>.</td></tr>
+<tr><td class="k">hitze_extrem_pos</td><td>10</td><td>Position bei extremer Hitze.</td></tr>
+</table>
+
+<h3>Temperaturschwellen</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Bedeutung</th></tr>
+<tr><td class="k">raumtemp_max_schwelle</td><td>23,5 °C</td><td>Ab dieser Innentemperatur gilt Hitze-Alarm. Bei bereits aktiver Beschattung rechnet der Blueprint intern mit Schwelle minus 1 K als Hysterese.</td></tr>
+<tr><td class="k">raumtemp_min_schwelle</td><td>21,0 °C</td><td>Winter-Sperre. Unterhalb dieser Innentemperatur wird nie beschattet – die Sonne darf heizen. <span class="new">Korrekt umgesetzt erst ab V89; bis V88 bewirkte die Sperre das Gegenteil (Beschattung bei Kälte, Auffahren gesperrt).</span></td></tr>
+<tr><td class="k">aussentemp_schwelle</td><td>25,0 °C</td><td>Außentemperatur, ab der beschattet werden darf. ODER-verknüpft mit der Innenschwelle.</td></tr>
+<tr><td class="k">hitze_extrem_innen_ein</td><td>25,0 °C</td><td>Innenschwelle, ab der der Extrem-Modus einsetzt.</td></tr>
+<tr><td class="k">hitze_extrem_innen_aus</td><td>23,5 °C</td><td>Innenschwelle, unter der der Extrem-Modus endet.</td></tr>
+<tr><td class="k">hitze_extrem_aussen_ein</td><td>28,0 °C</td><td>Außenschwelle für den Extrem-Modus.</td></tr>
+<tr><td class="k">hitze_extrem_aussen_aus</td><td>26,0 °C</td><td>Außenschwelle, unter der der Extrem-Modus endet.</td></tr>
+</table>
+<div class="warn"><p><strong>Mindestabstand einhalten:</strong> Zwischen <code>raumtemp_min_schwelle</code> und <code>raumtemp_max_schwelle</code> sollten mindestens 2 K liegen. Bei zu engem Fenster (z. B. 21 / 22 °C) fallen Ein- und Ausschaltpunkt praktisch zusammen und das Rollo pendelt. Bewährt: 20 °C / 22,5 °C.</p></div>
+
+<h3>Helligkeit und PV</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Bedeutung</th></tr>
+<tr><td class="k">pv_sensor</td><td>leer</td><td>PV-Leistung. W oder kW – wird automatisch erkannt.</td></tr>
+<tr><td class="k">pv_schwelle</td><td>2000 W</td><td>Ab dieser Leistung gilt es als »hell«. Beim Doppelten der Schwelle (»es knallt«) wird die Wetterprüfung übersprungen.</td></tr>
+<tr><td class="k">lux_sensor</td><td>leer</td><td>Helligkeitssensor, idealerweise pro Fassadenseite.</td></tr>
+<tr><td class="k">lux_schwelle</td><td>25000</td><td>Ab diesem Wert gilt es als »hell«. Der Default ist für Außensensoren im Schatten oft zu hoch – bei einem Sensor an der Fassade liegen praxistaugliche Werte eher bei 9.000–15.000 lx.</td></tr>
+</table>
+<p>Fallen beide Sensoren aus oder sind sie leer, entscheidet allein die Wetterentität (Failover).</p>
+
+<h3>Zeiten und Präsenz</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Bedeutung</th></tr>
+<tr><td class="k">zeit_fruehestens</td><td>06:30</td><td>Frühestes Öffnen an Werktagen.</td></tr>
+<tr><td class="k">sonnenaufgang_woche</td><td>an</td><td>Wenn aktiv, wird an Werktagen zusätzlich auf den Sonnenaufgang gewartet.</td></tr>
+<tr><td class="k">zeit_we_fruehestens</td><td>08:00</td><td>Frühestes Öffnen an Wochenenden, Feiertagen und im Urlaubsmodus.</td></tr>
+<tr><td class="k">zeit_spaetestens</td><td>09:30</td><td>Harter Fallback: zu dieser Zeit wird geöffnet, auch ohne Präsenz.</td></tr>
+<tr><td class="k">zeit_oeffnen_sperre</td><td>11:00</td><td>Ende der Morgenphase. Danach wird ein geschlossenes Rollo als manuell geschlossen gewertet (siehe Kapitel 9).</td></tr>
+<tr><td class="k">zeit_kontrolle</td><td>22:00</td><td>Zeitpunkt des Abend-Checks auf offene Fenster.</td></tr>
+<tr><td class="k">sunset_offset</td><td>30 min</td><td>Verzögerung nach Sonnenuntergang bis zum Beginn des Nachtmodus. Negative Werte = früher schließen. Seit V87 wirkt der Wert auf die Nacht-Bedingung selbst und damit auf jeden Auslöser (korrekt umgesetzt erst ab V88).</td></tr>
+<tr><td class="k">praesenz_sensor</td><td>leer</td><td>Ein oder mehrere Präsenzmelder. Meldet einer <code>on</code> und die früheste Zeit ist erreicht, wird geöffnet.</td></tr>
+<tr><td class="k">workday_sensor</td><td>leer</td><td>Feiertagserkennung. <code>off</code> = späte Öffnungszeit.</td></tr>
+</table>
+<div class="note"><p><strong>Genauigkeit des Sonnenuntergangs-Versatzes:</strong> Der heutige Sonnenuntergang wird aus <code>next_setting</code> minus einem Tag abgeleitet. Um die Tagundnachtgleichen verschiebt sich der Sonnenuntergang um bis zu ca. 6 Minuten pro Tag, der berechnete Nachtbeginn liegt dann entsprechend daneben – im Herbst etwas zu früh, im Frühjahr etwas zu spät. Im Hochsommer und Winter geht die Abweichung gegen null. Bei Versätzen von 30–60 Minuten ohne praktische Bedeutung, bei sehr kurzen Werten gut zu wissen.</p></div>
+
+<h3>Benachrichtigungen</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Bedeutung</th></tr>
+<tr><td class="k">notify_handy</td><td>leer</td><td>Der Dienstname ohne Präfix. Bei <code>handys</code> ruft der Blueprint <code>notify.handys</code> auf.</td></tr>
+</table>
+<p class="new">Die Inputs notify_block_active und pause_timer sind in V89 entfallen.</p>
+
+<div class="pagebreak"></div>
+<h2>8. Einstellempfehlungen nach Himmelsrichtung</h2>
+<table>
+<tr><th style="width:11%">Fassade</th><th style="width:16%">Wechselzeit</th><th style="width:19%">Beschattung vm / nm</th><th>Begründung</th></tr>
+<tr><td>Ost</td><td>ca. 10:00</td><td>20–30 % / 30 %</td><td>Frühe, flache Sonne blendet stark. Nach Mittag ist die Fassade im Schatten – die Beschattung endet dann automatisch, weil <code>sonne_auf_f</code> falsch wird.</td></tr>
+<tr><td>Süd</td><td>ca. 11:00–13:00</td><td>50–65 % / 30–65 %</td><td>Hochstehende Sonne. Oft reicht eine teilweise Beschattung, weil der Dachüberstand mithilft.</td></tr>
+<tr><td>West</td><td>ca. 15:00</td><td>60 % / 40 %</td><td>Nachmittags flache, aggressive Sonne. Nachmittags weiter schließen als vormittags – die häufigste Fehlkonfiguration ist genau die umgekehrte Reihenfolge.</td></tr>
+<tr><td>Nord</td><td>beliebig</td><td>–</td><td>Beschattung meist überflüssig. Blueprint trotzdem sinnvoll für Lüftung, Nachtabsenkung und Durchgang.</td></tr>
+</table>
+
+<h3>Vorgehen bei der Erstinbetriebnahme</h3>
+<ol>
+<li>Erst ein Rollo einrichten und ein bis zwei sonnige Tage beobachten.</li>
+<li>Fährt es zu selten herunter? → Lux-Schwelle oder PV-Schwelle senken.</li>
+<li>Fährt es zu oft oder bei bewölktem Himmel herunter? → Schwellen anheben oder die Wetterprüfung wirken lassen.</li>
+<li>Pendelt es? → Abstand zwischen <code>raumtemp_min</code> und <code>raumtemp_max</code> vergrößern.</li>
+<li>Erst wenn ein Rollo sauber läuft, die Einstellungen auf die übrigen übertragen.</li>
+</ol>
+
+<h2>9. Der manuelle Override</h2>
+<p>Der Blueprint versucht zu erkennen, ob ein Rollo von Hand auf eine Position gefahren wurde, die er selbst nie anfahren würde. Ist das der Fall, hält er sich mit der Tag-Logik zurück und respektiert die Entscheidung des Nutzers.</p>
+<p>Die Erkennung funktioniert über die aktuelle Position. Als »automatisch« gelten – mit ±2 % Toleranz:</p>
+<ul>
+<li><code>max_oeffnung</code>, beide Beschattungspositionen, <code>lueftungs_pos</code>, <code>durchgangs_pos</code>, <code>hitze_extrem_pos</code></li>
+<li>vollständig geschlossen (≤ 5 %)</li>
+</ul>
+<p>Jede andere Position gilt als manueller Override. Zusätzlich gilt: ein geschlossenes Rollo <em>nach</em> der Morgen-Öffnungssperre wird ebenfalls als manuell geschlossen gewertet – wer morgens um 11 die Rollos wieder herunterlässt, will offenbar Ruhe haben.</p>
+<div class="note"><p><strong>Wichtig:</strong> Der Override bremst nur die Tag-Logik (Beschattung, Auffahren, Extrem-Hitzeschutz). Er wird bewusst ignoriert bei: Brandalarm, Durchgang/Querlüften und dem abendlichen Schließen. Sicherheit und Fensterlogik haben immer Vorrang.</p></div>
+<div class="warn"><p><strong>Nebenwirkung beim Einstellen:</strong> Wenn zwei Positionen zufällig sehr nah beieinander liegen (z. B. Lüftung 30 % und Beschattung 30 %), kann der Blueprint sie nicht mehr unterscheiden. Positionen mit mindestens 10 % Abstand wählen.</p></div>
+
+<div class="pagebreak"></div>
+<h2>10. Zusammenspiel mit einer Brandalarm-Automatisierung</h2>
+<p>Der Blueprint öffnet bei Brandalarm <strong>nicht</strong> selbst – er hält still. Das Öffnen als Fluchtweg übernimmt eine separate Automatisierung. Diese Arbeitsteilung ist Absicht: sonst würden sich beide gegenseitig überschreiben.</p>
+<p>Beispiel für die zugehörige Automatisierung (verkürzt):</p>
+<pre>alias: "Sicherheit: BRANDALARM"
+mode: parallel
+triggers:
+  - trigger: state
+    entity_id:
+      - binary_sensor.rauchmelder_wohnzimmer
+      - binary_sensor.rauchmelder_flur
+      - binary_sensor.hitzemelder_kueche
+    to: "on"
+actions:
+  # 1. Boolean setzen -&gt; der Blueprint zieht sich sofort zurueck
+  - action: input_boolean.turn_on
+    target:
+      entity_id: input_boolean.brandalarm_status
+
+  # 2. Kritische Push-Nachricht
+  - action: notify.handys
+    data:
+      title: "BRANDALARM!"
+      message: "Ausgeloest von: {{ trigger.to_state.name }}"
+      data:
+        priority: high
+        channel: alarm_stream
+
+  # 3. Alle Rollos als Fluchtweg oeffnen
+  - action: cover.set_cover_position
+    target:
+      entity_id:
+        - cover.rollo_wohnzimmer
+        - cover.rollo_schlafzimmer
+    data:
+      position: 100
+
+  # 4. Fluchtwegbeleuchtung
+  - action: light.turn_on
+    target:
+      entity_id: light.flur
+    data:
+      brightness_pct: 100</pre>
+<p><strong>Der Boolean wird nicht von selbst zurückgesetzt.</strong> Solange <code>input_boolean.brandalarm_status</code> auf <code>on</code> steht, sind alle Rolladen-Automatisierungen stillgelegt – auch nach einem harmlosen Fehlalarm durch Kochdunst oder Staub. Die Automatisierungen stehen dabei weiter auf <code>on</code> und wirken völlig gesund; sie steigen nur bei jedem Durchlauf sofort in Zweig 0 aus. Der Fehler ist von außen praktisch unsichtbar. Die beiden folgenden Bausteine lösen das.</p>
+
+<h3>10.1 Quittierter Reset per Push-Nachricht</h3>
+<p>Ein automatischer Reset wäre gefährlich: nach einem echten Ereignis will man nicht, dass die Rollos von allein wieder zufahren. Deshalb die Lösung mit Bestätigung durch einen Menschen – zwei zusätzliche Automatisierungen.</p>
+<h4>Automatisierung A – Reset anbieten</h4>
+<p>Sobald alle Melder seit 10 Minuten wieder ruhig sind und der Boolean noch aktiv ist, kommt eine Push-Nachricht mit Aktions-Buttons:</p>
+<pre>alias: "Sicherheit: BRANDALARM Reset anbieten"
+mode: single
+triggers:
+  - trigger: state
+    entity_id:
+      - binary_sensor.rauchmelder_wohnzimmer
+      - binary_sensor.rauchmelder_flur
+      # ... alle weiteren Melder
+    to: "off"
+    for:
+      minutes: 10
+  - trigger: state
+    entity_id: input_boolean.brandalarm_status
+    to: "on"
+    for:
+      minutes: 10
+conditions:
+  - condition: state
+    entity_id: input_boolean.brandalarm_status
+    state: "on"
+  - condition: state
+    entity_id:
+      - binary_sensor.rauchmelder_wohnzimmer
+      - binary_sensor.rauchmelder_flur
+      # ... alle weiteren Melder
+    state: "off"
+actions:
+  - action: notify.handys
+    data:
+      title: "Brandalarm: Melder wieder ruhig"
+      message: &gt;-
+        Alle Melder sind seit 10 Minuten zurueckgesetzt. Die Rolladensteuerung
+        ist weiterhin STILLGELEGT. Erst bestaetigen, wenn die Lage geklaert ist.
+      data:
+        ttl: 0
+        priority: high
+        actions:
+          - action: BRANDALARM_RESET
+            title: "Alarm zuruecksetzen"
+          - action: BRANDALARM_IGNORE
+            title: "Noch nicht"</pre>
+<h4>Automatisierung B – Reset bestätigt</h4>
+<p>Reagiert auf den Druck des Buttons in der Benachrichtigung:</p>
+<pre>alias: "Sicherheit: BRANDALARM Reset bestaetigt"
+mode: single
+triggers:
+  - trigger: event
+    event_type: mobile_app_notification_action
+    event_data:
+      action: BRANDALARM_RESET
+conditions:
+  - condition: state
+    entity_id: input_boolean.brandalarm_status
+    state: "on"
+actions:
+  - action: input_boolean.turn_off
+    target:
+      entity_id: input_boolean.brandalarm_status
+  - action: notify.handys
+    data:
+      title: "Brandalarm zurueckgesetzt"
+      message: &gt;-
+        Die Rolladensteuerung ist wieder aktiv. Normaler Betrieb innerhalb
+        der naechsten 5 Minuten.</pre>
+<div class="fix"><p>Wird der Button nie gedrückt, passiert schlicht nichts – die Rollos bleiben oben. Es gibt bewusst keinen Zeitablauf, der die Entscheidung dem Menschen aus der Hand nimmt. Nach dem Reset fahren die Rollos nicht schlagartig los, sondern greifen beim nächsten regulären Durchlauf, also spätestens nach 5 Minuten (<code>time_pattern</code>).</p></div>
+<p>Beim Anlegen über die HA-API meldet der Validator ggf., <code>BRANDALARM_RESET</code> sei „not found in service registry". Das ist ein Fehlalarm des Prüfers – es handelt sich um eine Notification-Action-ID, nicht um einen Dienstnamen.</p>
+
+<h3>10.2 Dashboard-Karte als zweites Sicherheitsnetz</h3>
+<p>Falls das Handy einmal nicht greifbar ist, sollte der Boolean auch in der UI erreichbar sein. Eine bedingte Karte zeigt ihn nur, solange der Alarm aktiv ist, und verschwindet nach dem Zurücksetzen von selbst:</p>
+<pre>type: conditional
+conditions:
+  - condition: state
+    entity: input_boolean.brandalarm_status
+    state: "on"
+card:
+  type: tile
+  entity: input_boolean.brandalarm_status
+  name: BRANDALARM – Rolladensteuerung gesperrt
+  icon: mdi:fire-alert
+  color: red
+  features:
+    - type: toggle
+grid_options:
+  columns: full</pre>
+<p>Sinnvolle Position: ganz oben im Hauptdashboard, direkt unter den Personen-Badges – dort fällt sie im Ernstfall sofort auf, stört im Normalbetrieb aber nicht, weil sie unsichtbar ist.</p>
+
+<div class="pagebreak"></div>
+<h2>11. Fehlersuche und Debugging</h2>
+<h3>Traces lesen</h3>
+<p>Einstellungen → Automatisierungen → die betroffene Automatisierung → Menü rechts oben → <em>Traces</em>. Dort zeigt HA für jeden Durchlauf, welcher <code>choose</code>-Zweig gewählt wurde und mit welchen Variablenwerten. Der Reiter <em>Changed Variables</em> ist am aufschlussreichsten – dort stehen <code>sonne_auf_f</code>, <code>hitze_alarm</code>, <code>beschattung_aktiv</code>, <code>is_manual_override</code> und <code>aktuelle_pos</code> im Klartext.</p>
+<div class="note"><p>Läuft ein Durchlauf auf einen Template-Fehler, zeigt der Trace statt eines gewählten Zweigs ein <code>error</code>-Feld und kein <code>execution</code>. Das ist der schnellste Weg, einen Fehler in einer Variablen von einem inhaltlich falschen Zweig zu unterscheiden: Bei einem Template-Fehler wird gar kein Zweig erreicht, und das Rollo bleibt vollständig stehen – auch die Tag-Logik.</p></div>
+
+<h3>Typische Symptome</h3>
+<table>
+<tr><th style="width:30%">Symptom</th><th>Ursache und Abhilfe</th></tr>
+<tr><td>Rollo beschattet nie</td><td>Prüfen: Innentemperatur über der Winter-Sperre? Sonne im Azimut-Fenster der gewählten Himmelsrichtung? Lux-/PV-Schwelle realistisch? Wetterentität liefert einen der erkannten Zustände?</td></tr>
+<tr><td>Rollo beschattet dauernd</td><td>Meist eine zu niedrig gesetzte Außenschwelle in Verbindung mit der ODER-Logik. Außenschwelle anheben.</td></tr>
+<tr><td class="new">Rollo beschattet an kühlen Tagen, obwohl die Innentemperatur unter der Winter-Sperre liegt</td><td class="new">Blueprint-Version prüfen. Bis V88 war hitze_alarm unterhalb der Winter-Sperre immer wahr: Zweig 4b beschattete bei Sonne, Zweig 4c (Auffahren) war gesperrt. Ab V89 behoben.</td></tr>
+<tr><td>Rollo pendelt</td><td>Zu enger Abstand der Temperaturschwellen oder zwei Positionen zu nah beieinander (Override-Erkennung greift nicht sauber).</td></tr>
+<tr><td>Rollo fährt morgens nicht hoch</td><td>Kein Präsenzmelder ausgelöst und <code>zeit_spaetestens</code> noch nicht erreicht. Oder: <code>sonnenaufgang_woche</code> aktiv und die Sonne ist im Winter noch nicht auf.</td></tr>
+<tr><td>Rollo ignoriert die Tag-Logik</td><td>Höchstwahrscheinlich <code>is_manual_override</code>. Rollo einmal auf eine bekannte Position fahren (z. B. ganz auf), dann greift die Automatik wieder.</td></tr>
+<tr><td>Push-Nachrichten kommen nicht an</td><td>Der Notify-Dienst existiert nicht. Unter Entwicklerwerkzeuge → Aktionen prüfen, ob <code>notify.&lt;name&gt;</code> aufgeführt ist. Nach Anlegen einer Notify-Gruppe ist ein Neustart nötig.</td></tr>
+<tr><td>Gar nichts fährt mehr</td><td><code>input_boolean.brandalarm_status</code> prüfen – steht der auf <code>on</code>, ist der Blueprint stillgelegt. Mit der bedingten Dashboard-Karte aus Kapitel 10.2 sieht man das sofort. Zeigen die Traces stattdessen einen <code>TypeError</code> oder einen anderen Template-Fehler, liegt ein Fehler in einer Variablen vor – siehe Hinweis oben.</td></tr>
+<tr><td>Rollo schließt sofort bei Sonnenuntergang, obwohl ein Versatz eingestellt ist</td><td>Blueprint-Version prüfen. Vor V87 wirkte <code>sunset_offset</code> nur auf den Sonnenuntergangs-Trigger und wurde durch <code>mode: restart</code> zusätzlich ausgehebelt. Ab V87 steckt der Versatz in der Nacht-Bedingung.</td></tr>
+</table>
+
+<h3>Variablen live testen</h3>
+<p>Entwicklerwerkzeuge → Vorlage. Damit lässt sich z. B. prüfen, ob die Sonne gerade auf die Fassade scheint:</p>
+<pre>Azimut:    {{ state_attr('sun.sun', 'azimuth') }}
+Elevation: {{ state_attr('sun.sun', 'elevation') }}
+Position:  {{ state_attr('cover.rollo_wohnzimmer', 'current_position') }}</pre>
+<p>Für den Nachtbeginn:</p>
+<pre>{% set offset = 15 %}
+Sonnenuntergang: {{ (state_attr('sun.sun','next_setting') | as_datetime
+                     - timedelta(days=1)) | as_local }}
+Nachtbeginn:     {{ (state_attr('sun.sun','next_setting') | as_datetime
+                     - timedelta(days=1)
+                     + timedelta(minutes=offset)) | as_local }}</pre>
+<div class="warn"><p><code>state_attr('sun.sun','next_setting')</code> liefert einen <strong>String</strong>, kein <code>datetime</code>. Ohne <code>| as_datetime</code> scheitert jede Rechnung damit an einem <code>TypeError</code>. Das gilt für eigene Templates genauso wie für Anpassungen am Blueprint.</p></div>
+<div class="warn"><p><strong>Bedingungs-Variablen immer als eine Expression schreiben, nie als <code>{% if %}</code>-Block.</strong> Ein Jinja-Block liefert keinen Boolean, sondern rendert einen mehrzeiligen String. Jeder nicht-leere String ist in Jinja truthy – ein Block, der das Wort <code>false</code> ausgibt, wird also als <em>wahr</em> gewertet. Home Assistant wandelt nur exakte Python-Literale um: <code>False</code> mit großem F. Genau daran ist V87 gescheitert (<code>ist_nacht</code> war rund um die Uhr wahr, die Rollos fuhren mittags zu)<span class="new"> – und derselbe Fehler steckte bis V88 im else-Zweig von <code>hitze_alarm</code>, wodurch die Winter-Sperre ins Gegenteil verkehrt war</span>. Richtig ist eine einzelne Expression mit <code>and</code>/<code>or</code>, die einen echten Boolean zurückgibt. Zum Prüfen im Vorlagen-Editor den Rohwert in Anführungszeichen ausgeben – steht dort etwas anderes als exakt <code>True</code> oder <code>False</code>, ist es ein String.</p></div>
+
+<h2>12. Bekannte Einschränkungen</h2>
+<ul>
+<li><strong>Nur positionsfähige Rollos.</strong> Reine Auf/Zu-Antriebe ohne <code>current_position</code> funktionieren nicht.</li>
+<li><strong>Keine Lamellensteuerung.</strong> Raffstores mit Lamellenwinkel werden nur über die Höhe angesteuert.</li>
+<li><strong>Ein Rollo pro Automatisierung.</strong> Das ist Absicht (individuelle Parameter je Fenster), bedeutet aber bei vielen Fenstern entsprechend viele Automatisierungen.</li>
+<li><strong>Keine Verschattungsberechnung durch Nachbargebäude oder Bäume.</strong> Der Azimut-Bereich ist ein grobes Modell. Wer eine Baumreihe vor dem Westfenster hat, muss den Winkelbereich oder die Lux-Schwelle entsprechend anpassen.</li>
+<li><strong>Kein Windschutz.</strong> Für Markisen oder außenliegende Behänge mit Windrisiko wäre eine zusätzliche, übergeordnete Sperre nötig.</li>
+<li><strong>Der Brandalarm-Boolean wird vom Blueprint nicht zurückgesetzt.</strong> Das ist Absicht – der Reset gehört in eine eigene, quittierte Automatisierung. Siehe Kapitel 10.</li>
+<li>Das <code>time_pattern</code> alle 5 Minuten bedeutet: eine Änderung an den Bedingungen wirkt sich im ungünstigsten Fall erst nach 5 Minuten aus. Das betrifft auch den Beginn des Nachtmodus.</li>
+<li>Der Sonnenuntergang wird aus <code>next_setting</code> minus einem Tag abgeleitet und weicht um die Tagundnachtgleichen um bis zu ca. 6 Minuten ab. Siehe Kapitel 7.</li>
+</ul>
+
+<div class="pagebreak"></div>
+<h2>13. Changelog</h2>
+<table>
+<tr><th style="width:9%">Version</th><th>Änderungen</th></tr>
+<tr><td class="c"><strong class="new">V89</strong></td><td>Fix: Die <strong>Winter-Sperre (<code>raumtemp_min_schwelle</code>) wirkte umgekehrt</strong>. Unterhalb der Schwelle gab <code>hitze_alarm</code> im <code>{% else %}</code>-Zweig das nackte Wort <code>false</code> aus – dieselbe Fehlerklasse wie in V88: ein nicht-leerer String und damit truthy. Unter der Winter-Sperre war <code>hitze_alarm</code> deshalb immer wahr: Block 4b beschattete, sobald die Sonne auf der Fassade stand und PV/Helligkeit hoch waren, und Block 4c (Auffahren) war über <code>not hitze_alarm</code> gesperrt. Gerade an kühlen Tagen, an denen Sonnenwärme erwünscht ist, fuhren die Rollos also in die Beschattung. <code>hitze_alarm</code> ist jetzt eine einzelne Boolean-Expression; oberhalb der Winter-Sperre ist das Verhalten (inkl. 1 °C Hysterese während der Beschattung) unverändert. <strong>Entfernt:</strong> Inputs <code>pause_timer</code> und <code>notify_block_active</code> sowie die ungenutzten Variablen <code>v_timer</code>, <code>v_notify_block_raw</code>, <code>v_notify_block</code> und <code>pause_aktiv</code>. <strong>Migration:</strong> beide Inputs aus bestehenden Automatisierungen entfernen; der Timer-Helfer für die Benachrichtigungspause wird nicht mehr benötigt. <strong>Korrigiert:</strong> <code>source_url</code> zeigt auf den tatsächlichen Pfad im Repo-Root.</td></tr>
+<tr><td class="c"><strong>V88</strong></td><td>Fix: V87 enthielt ein defektes <code>ist_nacht</code> und <strong>darf nicht verwendet werden</strong>. Die Bedingung war als <code>{% if %}</code> / <code>{% else %}</code>-Block geschrieben und gab dort das nackte Wort <code>false</code> aus. Ein Jinja-Block liefert aber keinen Boolean, sondern rendert einen mehrzeiligen <em>String</em> (<code>"\n  false\n"</code>) – und jeder nicht-leere String ist truthy. Home Assistant wandelt nur exakte Python-Literale um (<code>False</code>, groß geschrieben); kleingeschriebenes <code>false</code> blieb damit ein String und wurde als <strong>wahr</strong> gewertet. <code>ist_nacht</code> war folglich rund um die Uhr wahr: Block 3 griff zu jeder Tageszeit und fuhr die Rollos bei hellem Tageslicht in die Lüftungs- oder Schließposition, während Block 4 (<code>not ist_nacht</code>) überhaupt nicht mehr lief. Behoben durch eine einzelne <code>and</code>-Expression, die einen echten Boolean liefert: Sonne über dem Horizont → <code>False</code>, darunter → der Zeitvergleich. Generelle Lehre für den Blueprint: Jede Variable, die als Bedingung dient, muss eine Expression sein, niemals ein <code>{% if %}</code>-Block.</td></tr>
+<tr><td class="c"><strong>V87</strong></td><td><em>(fehlerhaft, ersetzt durch V88)</em> Fix: Der eingestellte <strong>Sonnenuntergangs-Versatz war faktisch wirkungslos</strong>. Er lag als <code>delay</code> in Block 3 und wurde nur ausgeführt, wenn <code>trigger.id == 'sunset_event'</code> war. Jeder andere Trigger – Präsenzmelder, Fensterkontakt, PV, Hausmodus, Sicherheitsnetz – lief ohne Verzögerung durch, und <code>ist_nacht</code> war ab Sonnenuntergang sofort wahr. Die Rollos fuhren dadurch binnen Minuten nach Sonnenuntergang zu, obwohl z. B. 60 Minuten eingestellt waren. Zweites, tieferliegendes Problem: Auch der <code>sunset_event</code>-Pfad hat nie funktioniert, weil die Automatisierung in <code>mode: restart</code> läuft – der laufende <code>delay</code> wurde vom nächsten Trigger abgebrochen, seit V85 (<code>/15</code> → <code>/5</code>) also spätestens nach 5 Minuten, und der Neulauf erfüllte <code>ist_nacht</code> und schloss sofort. Lösung: Der Versatz steckt jetzt in der Variable <code>ist_nacht</code> statt in einem <code>delay</code>. Damit gilt er für <em>jeden</em> Trigger und ist gegen <code>mode: restart</code> immun. Das <code>delay</code>-Konstrukt in Block 3 ist ersatzlos entfallen. Ein zusätzlicher Trigger ist nicht nötig – das bestehende <code>/5</code>-Sicherheitsnetz löst Block 3 aus, sobald <code>ist_nacht</code> kippt, die maximale Ungenauigkeit beträgt also 5 Minuten. <strong>Alle Inputs sind unverändert</strong> (<code>sunset_offset</code> behält Key, Typ, Default und Selector), ein Re-Import aktualisiert bestehende Automatisierungen daher ohne Neukonfiguration. Hinweis zur Umsetzung: <code>state_attr('sun.sun','next_setting')</code> liefert einen <strong>String</strong>, kein <code>datetime</code> – die Subtraktion braucht daher ein <code>| as_datetime</code>. Fehlt es, wirft das Template einen <code>TypeError</code>, <code>ist_nacht</code> rendert nicht, und weder Block 3 (<code>ist_nacht</code>) noch Block 4 (<code>not ist_nacht</code>) wird erreicht: Das Rollo bleibt komplett stehen. Block 4 bleibt bewusst auf <code>not ist_nacht</code>: In der neuen Dämmerungsphase (Sonne unten, Versatz läuft noch) sind <code>ist_hell</code> <em>und</em> <code>ist_nacht</code> false, und 4c nutzt dieses Fenster, um Rollos hochzufahren, die noch in Beschattungsposition stehen. Manuell geschlossene Rollos bleiben über <code>is_manual_override</code> unten.</td></tr>
+<tr><td class="c"><strong>V86</strong></td><td>Fix: Block 4c (Auffahren) prüfte <code>not lueftung_aktiv</code> und sperrte damit das Hochfahren dauerhaft, solange ein Fenster auf Kipp stand – nicht nur während der Beschattung. Das Rollo fuhr über 4a/4b korrekt in die Beschattungs- bzw. Extrem-Position, kam nach Ende der Sonnenstandsfahrt aber nicht wieder hoch. Bedingung entfernt: Die Lüftungsposition ist im gesamten Blueprint als <strong>Mindesthöhe</strong> modelliert – 1b fährt nur hoch, wenn die aktuelle Position darunter liegt, Block 3 schließt abends nur bis dorthin, und auch 4a/4b prüfen sie nicht –, nicht als Obergrenze. <code>sperrschutz</code> bleibt in 4c erhalten, und da Block 4 nur tagsüber läuft, bleibt die nächtliche Kipp-Logik in Block 3 unberührt.</td></tr>
+<tr><td class="c"><strong>V85</strong></td><td>Fix: Der PV-Trigger war als <code>state</code> mit <code>for: 2min</code> definiert und feuerte bei einem sich ständig ändernden Watt-Sensor praktisch nie, da das <code>for</code>-Fenster bei jeder Wertänderung neu startete – die Beschattung reagierte dadurch nie direkt auf die PV-Leistung, sondern nur im Zufallstakt. Jetzt <code>numeric_state</code> (<code>above</code>/<code>below</code> <code>pv_schwelle</code>, je <code>for: 2min</code>), was korrekt entprellt. Änderung: Sicherheitsnetz (<code>time_pattern</code>) von <code>/15</code> auf <code>/5</code> Minuten verkürzt, damit die Öffnungs-Feinkante bei <code>pv_schwelle − 500</code> bzw. <code>lux_schwelle − 5000</code> binnen maximal 5 statt 15 Minuten erkannt wird. <code>mode: restart</code> und die Positions-Guards verhindern weiterhin Mehrfachfahrten.</td></tr>
+<tr><td class="c"><strong>V84</strong></td><td>Neu: Ganz geöffnetes Fenster fährt das Rollo ganz auf, wenn kein Sonnenstands-Modus aktiv ist (auch nachts, vor der Öffnungszeit und aus manuell geschlossenem Zustand); bei aktiver Beschattung weiterhin nur bis zur Durchgangsposition. Fix: Variablenreihenfolge – <code>sonne_auf_f</code> wird jetzt vor <code>hitze_extrem</code> definiert. Neu: Workday-Sensor als Input für Feiertagserkennung. Neu: Hilfsvariablen zur Entzerrung der Helligkeitslogik.</td></tr>
+<tr><td class="c"><strong>V83</strong></td><td>Extrem-Hitzeschutz mit separater Position und Hysterese über Innen- und Außentemperatur.</td></tr>
+<tr><td class="c"><strong>V82</strong></td><td>Anti-Flapping: PV-Trigger mit Entprellung, <code>mode: restart</code>, 15-Minuten-Sicherheitsnetz.</td></tr>
+</table>
+
+<div class="footer">
+<p>Diese Dokumentation beschreibt den Blueprint »Master-Rolladensteuerung V89«. Verwendung auf eigene Verantwortung – insbesondere die Brandalarm-Kopplung sollte vor dem Produktivbetrieb einmal vollständig durchgetestet werden (Boolean von Hand setzen und prüfen, ob alle Rollos wie erwartet reagieren).</p>
+<p>Rot hervorgehobene Passagen kennzeichnen Änderungen gegenüber der vorherigen Dokumentationsfassung (Stand V88).</p>
+</div>
+
+</body>
+</html>

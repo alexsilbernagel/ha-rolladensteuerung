@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Master Roller Shutter Control V89 – Documentation</title>
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+
+<h1>Master Roller Shutter Control V89</h1>
+<p class="subtitle">Home Assistant blueprint – sun-position shading, extreme-heat protection, ventilation and walk-through logic</p>
+<p class="meta">Complete documentation · As of October 2026 · Version V89 · Blueprint domain: automation</p>
+
+<h2>Contents</h2>
+<div class="toc">
+<ol>
+<li>What the blueprint does</li>
+<li>How it works: the priority chain</li>
+<li>Prerequisites and required entities</li>
+<li>Creating helpers and template sensors</li>
+<li>Window sensors: tilted vs. fully open</li>
+<li>Installing the blueprint</li>
+<li>Complete input reference</li>
+<li>Recommended settings by facade orientation</li>
+<li>The manual override</li>
+<li>Working with a fire-alarm automation (including acknowledged reset and dashboard card)</li>
+<li>Troubleshooting and debugging</li>
+<li>Known limitations</li>
+<li>Changelog</li>
+</ol>
+</div>
+
+<h2>1. What the blueprint does</h2>
+<p>The blueprint controls a single roller shutter fully automatically throughout the day. One automation is created from the blueprint per shutter, so every room can have its own facade orientation, temperature thresholds and positions.</p>
+<p>It combines six jobs that would otherwise need separate automations:</p>
+<ul>
+<li><strong>Morning opening</strong> – based on time of day, sunrise, presence, weekday, public holiday and house mode.</li>
+<li><strong>Sun-position shading</strong> – the shutter only lowers when the sun actually hits this facade (azimuth window per orientation), when it is bright enough (PV power or lux) and when the temperature justifies it.</li>
+<li><strong>Extreme-heat protection</strong> – at very high indoor and outdoor temperatures the shutter moves to a separate, much lower position. With hysteresis to prevent oscillation.</li>
+<li><strong>Ventilation position</strong> – a tilted window keeps the shutter at a defined minimum height.</li>
+<li><strong>Walk-through and cross-ventilation logic</strong> – a fully opened window or patio door raises the shutter so nobody gets locked out and no manual intervention is needed.</li>
+<li><strong>Evening closing</strong> – after sunset with a configurable offset, taking open windows into account.</li>
+</ul>
+<div class="note"><p><strong>Core idea:</strong> the blueprint never decides on a single condition but follows a fixed priority chain. Safety beats comfort, comfort beats energy.</p></div>
+
+<h2>2. How it works: the priority chain</h2>
+<p>On every trigger the blueprint walks a <code>choose</code> chain from top to bottom. The first matching branch wins; all others are skipped.</p>
+<table>
+<tr><th style="width:7%">Prio</th><th style="width:22%">Branch</th><th>Condition and effect</th></tr>
+<tr><td>0</td><td>Fire alarm</td><td>If the fire-alarm boolean is <code>on</code>, execution ends immediately with <code>stop</code>. The blueprint moves nothing – it stays quiet so it does not close shutters that an external fire-alarm automation has opened as an escape route. See chapter 10.</td></tr>
+<tr><td>1a</td><td>Walk-through / cross-ventilation</td><td>A sensor from <em>window fully open</em> reports <code>on</code>. The shutter raises:<br>• no shading active → to <code>max_oeffnung</code> (fully open)<br>• shading or extreme-heat protection active → only to <code>durchgangs_pos</code><br>Also applies at night, before the morning opening time and from a manually closed state. The shutter is never lowered here, only raised.</td></tr>
+<tr><td>1b</td><td>Ventilation (tilt)</td><td>A sensor from <em>window ventilation</em> reports <code>on</code> and no fully-open sensor is active. The shutter moves to at least <code>lueftungs_pos</code> so the curtain does not rest on the tilted sash.</td></tr>
+<tr><td>2</td><td>Evening check</td><td>At the configured check time (default 22:00) the blueprint verifies whether a window is still fully open and sends a push notification.</td></tr>
+<tr><td>3</td><td>Closing</td><td>Night (sunset plus <code>sunset_offset</code>) and no window fully open → the shutter closes. With a tilted window it closes only down to <code>lueftungs_pos</code>. Since V87 the offset lives in the night condition itself and therefore applies to every trigger, not just the sunset one.</td></tr>
+<tr><td>4a</td><td>Extreme-heat protection</td><td>Sun on the facade <em>and</em> indoor temperature above the ON threshold <em>and</em> outdoor temperature above the ON threshold → the shutter moves to <code>hitze_extrem_pos</code>. The mode only ends once indoor or outdoor temperature drops below the respective OFF threshold (hysteresis).</td></tr>
+<tr><td>4b</td><td>Normal shading</td><td>Sun on the facade <em>and</em> heat alarm <em>and</em> enough light (PV or lux) → the shutter moves to the shading position. Configurable separately for morning and afternoon.</td></tr>
+<tr><td>4c</td><td>Raising</td><td>No sun protection needed (sun gone, cloudy, cool) → the shutter moves to <code>max_oeffnung</code>. <span class="new">Below the winter lock this branch works reliably since V89 – before, it stayed blocked there.</span></td></tr>
+</table>
+
+<h3>When does the automation actually run?</h3>
+<p>Triggers are: state changes of the window sensors, presence detectors, PV power (debounced by 2 min), sunset, the <em>latest opening</em> and <em>evening check</em> times, a change of house mode – plus a <code>time_pattern</code> every 5 minutes as a safety net. The mode is <code>restart</code>: a new trigger aborts a run in progress.</p>
+<div class="note"><p>Since V87 there is no dedicated trigger for the sunset offset. The safety net fires the closing branch as soon as the night condition flips, so the worst-case delay is 5 minutes. A <code>delay</code> would be useless here because <code>mode: restart</code> aborts any pending run on the next trigger.</p></div>
+
+<h3>The three sun conditions in detail</h3>
+<ul>
+<li><code>sonne_auf_f</code> – the sun azimuth falls within the angular range of the chosen orientation and elevation is above 5°. Prevents shading when the sun is not on the window at all.</li>
+<li><code>sonne_stark</code> – PV power above the threshold or lux above the threshold, each sanity-checked against the weather entity. If a sensor fails, a failover based on weather alone takes over.</li>
+<li><code>hitze_alarm</code> – an OR combination: indoor temperature above the indoor threshold, or a rising temperature trend, or outdoor temperature above the outdoor threshold. A winter lock (<code>raumtemp_min_schwelle</code>) suppresses everything while the room is too cool. <span class="new">This lock only works correctly from V89: up to V88, <code>hitze_alarm</code> was wrongly always true below the winter lock – see the changelog.</span></li>
+</ul>
+<div class="warn"><p><strong>Important to understand:</strong> because <code>hitze_alarm</code> is an OR combination, a very low outdoor threshold (e.g. 10 °C) makes the indoor temperature practically irrelevant – above 10 °C outside the condition is always true in summer, and only sun position and brightness decide. That may be intended ("the sun blinds me at 15 °C too"), but it should be a conscious choice.</p></div>
+
+<div class="pagebreak"></div>
+<h2>3. Prerequisites and required entities</h2>
+<table>
+<tr><th style="width:26%">What</th><th style="width:9%">Required</th><th>Description</th></tr>
+<tr><td><code>cover.*</code></td><td>yes</td><td>Roller shutter with position support (<code>set_cover_position</code> and the <code>current_position</code> attribute). Pure open/close shutters do not work.</td></tr>
+<tr><td><code>sun.sun</code></td><td>yes</td><td>Standard integration. Provides azimuth and elevation.</td></tr>
+<tr><td><code>weather.*</code></td><td>yes</td><td>Any weather entity. Used for plausibility checks and as a failover.</td></tr>
+<tr><td>Room temperature sensor</td><td>yes</td><td><code>sensor</code> with <code>device_class: temperature</code>.</td></tr>
+<tr><td>Outdoor temperature sensor</td><td>yes</td><td>Own sensor or e.g. OpenWeatherMap.</td></tr>
+<tr><td><code>input_select</code> house mode</td><td>yes</td><td>Helper with at least the options Zuhause, Abwesend, Urlaub (home, away, holiday).</td></tr>
+<tr><td><code>input_boolean</code> fire alarm</td><td>yes</td><td>Set by the external fire-alarm automation.</td></tr>
+<tr><td>Window sensor tilt</td><td>no</td><td><code>binary_sensor</code>, multiple selection possible.</td></tr>
+<tr><td>Window sensor fully open</td><td>no</td><td><code>binary_sensor</code>, multiple selection possible. Leave empty for windows that are never fully opened.</td></tr>
+<tr><td>Presence detector</td><td>no</td><td>Multiple selection. Triggers the morning "starting signal".</td></tr>
+<tr><td>PV power sensor</td><td>no</td><td>W or kW – the unit is detected and converted automatically.</td></tr>
+<tr><td>Illuminance sensor</td><td>no</td><td><code>device_class: illuminance</code>. One sensor per facade side is ideal.</td></tr>
+<tr><td>Trend sensor</td><td>no</td><td><code>binary_sensor</code>, <code>on</code> = room temperature rising. See chapter 4.</td></tr>
+<tr><td>Workday sensor</td><td>no</td><td>For public-holiday detection. See chapter 4.</td></tr>
+<tr><td>Notify service</td><td>no</td><td>Recommendation: a notify group, see chapter 4.</td></tr>
+</table>
+<p class="new">Since V89 the notification-pause timer is no longer needed – the blueprint had stopped evaluating it.</p>
+
+<h2>4. Creating helpers and template sensors</h2>
+
+<h3>4.1 House mode (input_select)</h3>
+<p>Settings → Devices &amp; Services → Helpers → Create helper → Dropdown. Name: Hausmodus. Write the options exactly like this – the blueprint compares text values:</p>
+<pre>Zuhause
+Abwesend
+Urlaub</pre>
+<p>Effect: <em>Urlaub</em> switches to the late opening time. <em>Abwesend</em> and <em>Urlaub</em> also allow opening without a presence report.</p>
+
+<h3>4.2 Fire-alarm status (input_boolean)</h3>
+<p>Create helper → Toggle. Name e.g. Brandalarm Status → entity <code>input_boolean.brandalarm_status</code>. This boolean is the interface between the smoke-detector automation and the shutter control.</p>
+
+<h3>4.3 Workday sensor (public holidays)</h3>
+<p>Settings → Devices &amp; Services → Add integration → Workday. Select country and region, mark weekends as non-working days. Result: <code>binary_sensor.workday_sensor</code>, which is <code>off</code> on weekends and holidays.</p>
+<p>The blueprint uses it like this: <code>off</code> → the late opening time applies (weekend/holiday). If the input is left empty, the blueprint falls back to a plain weekday check – public holidays are then not detected.</p>
+
+<h3>4.4 Trend sensor for room temperature</h3>
+<p>The trend sensor makes shading anticipatory: if the room temperature is rising, shading starts before the threshold is reached. Create it via the Trend integration (Settings → Devices &amp; Services → Add integration → Trend) or in YAML:</p>
+<pre>binary_sensor:
+  - platform: trend
+    sensors:
+      temp_wohnzimmer_rollo:
+        friendly_name: "Living room temp rising"
+        entity_id: sensor.temperatur_wohnzimmer
+        sample_duration: 1800     # 30 minute observation window
+        min_gradient: 0.0005      # approx. +0.9 K/h
+        device_class: heat</pre>
+<p>Create one such sensor per room and reference it in the corresponding automation.</p>
+
+<h3>4.5 Notify group (recommended)</h3>
+<p>Instead of entering the device service in every automation, use a notify group. When a device changes you then only edit one line. In <code>configuration.yaml</code>:</p>
+<pre>notify:
+  - platform: group
+    name: handys
+    services:
+      - service: mobile_app_my_phone
+      - service: mobile_app_partner_phone      # optional</pre>
+<p>Afterwards restart Home Assistant (a reload is not enough for notify platforms). In the blueprint you then enter only <code>handys</code> as the <em>phone notification service</em> – the blueprint builds <code>notify.handys</code> from it.</p>
+<div class="note"><p>Notify groups are legacy services and do not create an entity. They therefore do not appear under "States", only under Developer tools → Actions.</p></div>
+
+<h2>5. Window sensors: tilted vs. fully open</h2>
+<p>The blueprint distinguishes two window states because they have different consequences:</p>
+<ul>
+<li><strong>Tilted</strong> → the shutter may come down, but only to the ventilation position (otherwise the curtain rests on the sash).</li>
+<li><strong>Fully open</strong> → the shutter must go up (walk-through, cross-ventilation, no lock-out).</li>
+</ul>
+<p>A single reed contact cannot tell these apart – it only sees "sash moving away from frame". There are three practical approaches:</p>
+
+<h3>Option A – Two reed contacts (recommended, most robust)</h3>
+<p>One contact is placed so that it opens on tilt, a second so that it only opens on full opening (typically on the closing side of the sash). Both sensors go directly into the respective blueprint inputs – no templates needed. This is the option with the lowest error potential.</p>
+
+<h3>Option B – Handle sensor plus window contact</h3>
+<p>A window handle sensor (e.g. Aqara, Bosch) reports three states: closed / tilted / open. Combined with an opening contact, both states can be derived via template helpers:</p>
+<pre>template:
+  - binary_sensor:
+      - name: "Office window tilted"
+        unique_id: fenster_buero_kippstellung
+        device_class: window
+        state: &gt;
+          {{ is_state('sensor.fenstergriff_buero', 'tilt') }}
+
+      - name: "Office window fully open"
+        unique_id: fenster_buero_ganz_geoeffnet
+        device_class: window
+        state: &gt;
+          {{ is_state('sensor.fenstergriff_buero', 'open') }}</pre>
+<p>The exact state names (<code>open</code>, <code>tilt</code>, <code>closed</code>) depend on the device and integration – check under Developer tools → States.</p>
+
+<h3>Option C – Window contact plus separate handle contact</h3>
+<p>If only an opening contact (<code>A</code>) and a contact on the handle (<code>B</code>) are available, the logic can be derived like this:</p>
+<pre>template:
+  - binary_sensor:
+      - name: "Kitchen window tilted"
+        unique_id: fenster_kueche_kippstellung
+        device_class: window
+        state: &gt;
+          {{ is_state('binary_sensor.fenster_kueche_contact', 'on')
+             and is_state('binary_sensor.griff_kueche_contact', 'on') }}
+
+      - name: "Kitchen window fully open"
+        unique_id: fenster_kueche_ganz_geoeffnet
+        device_class: window
+        state: &gt;
+          {{ is_state('binary_sensor.fenster_kueche_contact', 'on')
+             and is_state('binary_sensor.griff_kueche_contact', 'off') }}</pre>
+<div class="note"><p><strong>Windows without a fully-open sensor:</strong> simply leave the <em>window fully open</em> input empty. The walk-through branch then never applies to that shutter – everything else keeps working. Useful for windows that are only ever tilted (guest WC, basement windows).</p></div>
+<div class="warn"><p><strong>Pitfall:</strong> if the same contact is entered as both the tilt and the fully-open sensor, the fully-open logic permanently blocks the ventilation logic. Only ever assign one of the two inputs per physical sensor.</p></div>
+
+<h2>6. Installing the blueprint</h2>
+<ol>
+<li>Place the YAML file under: <code>config/blueprints/automation/&lt;folder&gt;/&lt;filename&gt;.yaml</code></li>
+<li>Developer tools → YAML → Reload <em>automations</em>. For changes to <code>configuration.yaml</code>, do a full restart instead.</li>
+<li>Settings → Automations &amp; Scenes → Blueprints → select the blueprint → <em>Create automation</em>.</li>
+<li>Fill in all inputs for the first shutter, save, name it.</li>
+<li>Repeat for every further shutter.</li>
+</ol>
+<p>When the blueprint is updated later, it is enough to replace the file and reload the automations. The configured inputs are preserved as long as the input names stay the same. New inputs fall back to their default. <span class="new">Removed inputs (most recently in V89: <code>pause_timer</code> and <code>notify_block_active</code>) should be deleted from existing automations so no leftovers remain in the configuration.</span></p>
+<div class="note"><p>If the blueprint is imported via URL (<em>Re-import blueprint</em>), Home Assistant fetches the file directly from the source. A locally replaced file is overwritten in the process – so do not mix the two approaches. <span class="new">Since V89 the <code>source_url</code> points to the correct path in the repository root, so re-importing works again.</span></p></div>
+
+<div class="pagebreak"></div>
+<h2>7. Complete input reference</h2>
+
+<h3>Basics</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Meaning</th></tr>
+<tr><td class="k">rollo_entity</td><td>–</td><td>The shutter to control (<code>cover</code>).</td></tr>
+<tr><td class="k">himmelsrichtung</td><td>–</td><td>Azimuth window of the facade. Determines when "the sun shines on this window". For unusual facades pick the option whose angular range fits best.</td></tr>
+<tr><td class="k">brandalarm_entity</td><td class="k">input_boolean.<br>brandalarm_status</td><td>While <code>on</code>, the blueprint performs no movements at all.</td></tr>
+<tr><td class="k">hausmodus_entity</td><td>–</td><td>The house mode helper.</td></tr>
+<tr><td class="k">weather_entity</td><td>–</td><td>Weather entity for plausibility checks.</td></tr>
+</table>
+
+<h3>Positions (0 % = closed, 100 % = open)</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Meaning</th></tr>
+<tr><td class="k">max_oeffnung</td><td>94</td><td>Normal open position. Deliberately choose below 100 % if the curtain would otherwise hit its mechanical stop or if the position is not reported reliably at the very top.</td></tr>
+<tr><td class="k">beschattung_pos_morgens</td><td>60</td><td>Shading position before the switchover time.</td></tr>
+<tr><td class="k">beschattung_pos_nachmittags</td><td>60</td><td>Shading position after the switchover time.</td></tr>
+<tr><td class="k">beschattung_wechsel_zeit</td><td>13:00</td><td>Switchover point between the two shading positions. Rule of thumb: the moment the sun hits the facade head-on.</td></tr>
+<tr><td class="k">lueftungs_pos</td><td>15</td><td>Minimum height with a tilted window. Explicitly a lower bound, not a fixed position: if the shutter is higher, it stays where it is.</td></tr>
+<tr><td class="k">durchgangs_pos</td><td>80</td><td>Position with a fully opened window while shading or extreme-heat protection is active. Without active sun protection the shutter moves to <code>max_oeffnung</code> instead.</td></tr>
+<tr><td class="k">hitze_extrem_pos</td><td>10</td><td>Position during extreme heat.</td></tr>
+</table>
+
+<h3>Temperature thresholds</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Meaning</th></tr>
+<tr><td class="k">raumtemp_max_schwelle</td><td>23.5 °C</td><td>Indoor temperature above which the heat alarm applies. With shading already active the blueprint internally uses the threshold minus 1 K as hysteresis.</td></tr>
+<tr><td class="k">raumtemp_min_schwelle</td><td>21.0 °C</td><td>Winter lock. Below this indoor temperature there is never any shading – the sun is allowed to heat. <span class="new">Correctly implemented only from V89; up to V88 the lock did the opposite (shading when cold, raising blocked).</span></td></tr>
+<tr><td class="k">aussentemp_schwelle</td><td>25.0 °C</td><td>Outdoor temperature above which shading is permitted. OR-combined with the indoor threshold.</td></tr>
+<tr><td class="k">hitze_extrem_innen_ein</td><td>25.0 °C</td><td>Indoor threshold at which extreme mode starts.</td></tr>
+<tr><td class="k">hitze_extrem_innen_aus</td><td>23.5 °C</td><td>Indoor threshold below which extreme mode ends.</td></tr>
+<tr><td class="k">hitze_extrem_aussen_ein</td><td>28.0 °C</td><td>Outdoor threshold for extreme mode.</td></tr>
+<tr><td class="k">hitze_extrem_aussen_aus</td><td>26.0 °C</td><td>Outdoor threshold below which extreme mode ends.</td></tr>
+</table>
+<div class="warn"><p><strong>Keep a minimum gap:</strong> there should be at least 2 K between <code>raumtemp_min_schwelle</code> and <code>raumtemp_max_schwelle</code>. With too narrow a window (e.g. 21 / 22 °C) the on and off points effectively coincide and the shutter oscillates. Proven: 20 °C / 22.5 °C.</p></div>
+
+<h3>Brightness and PV</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Meaning</th></tr>
+<tr><td class="k">pv_sensor</td><td>empty</td><td>PV power. W or kW – detected automatically.</td></tr>
+<tr><td class="k">pv_schwelle</td><td>2000 W</td><td>Above this power it counts as "bright". At twice the threshold ("blazing") the weather check is skipped.</td></tr>
+<tr><td class="k">lux_sensor</td><td>empty</td><td>Illuminance sensor, ideally one per facade side.</td></tr>
+<tr><td class="k">lux_schwelle</td><td>25000</td><td>Above this value it counts as "bright". The default is often too high for outdoor sensors in the shade – for a sensor on the facade, practical values are more like 9,000–15,000 lx.</td></tr>
+</table>
+<p>If both sensors fail or are left empty, the weather entity decides on its own (failover).</p>
+
+<h3>Times and presence</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Meaning</th></tr>
+<tr><td class="k">zeit_fruehestens</td><td>06:30</td><td>Earliest opening on working days.</td></tr>
+<tr><td class="k">sonnenaufgang_woche</td><td>on</td><td>When active, working days additionally wait for sunrise.</td></tr>
+<tr><td class="k">zeit_we_fruehestens</td><td>08:00</td><td>Earliest opening on weekends, public holidays and in holiday mode.</td></tr>
+<tr><td class="k">zeit_spaetestens</td><td>09:30</td><td>Hard fallback: opening happens at this time even without presence.</td></tr>
+<tr><td class="k">zeit_oeffnen_sperre</td><td>11:00</td><td>End of the morning phase. After this a closed shutter counts as manually closed (see chapter 9).</td></tr>
+<tr><td class="k">zeit_kontrolle</td><td>22:00</td><td>Time of the evening check for open windows.</td></tr>
+<tr><td class="k">sunset_offset</td><td>30 min</td><td>Delay after sunset before night mode begins. Negative values close earlier. Since V87 the value acts on the night condition itself and therefore on every trigger (correctly implemented only from V88).</td></tr>
+<tr><td class="k">praesenz_sensor</td><td>empty</td><td>One or more presence detectors. If one reports <code>on</code> and the earliest time has been reached, the shutter opens.</td></tr>
+<tr><td class="k">workday_sensor</td><td>empty</td><td>Public-holiday detection. <code>off</code> = late opening time.</td></tr>
+</table>
+<div class="note"><p><strong>Precision of the sunset offset:</strong> today's sunset is derived from <code>next_setting</code> minus one day. Around the equinoxes sunset shifts by up to roughly 6 minutes per day, so the calculated night start is off by that much – a little early in autumn, a little late in spring. In midsummer and midwinter the deviation approaches zero. Irrelevant for offsets of 30–60 minutes, worth knowing for very short values.</p></div>
+
+<h3>Notifications</h3>
+<table>
+<tr><th style="width:27%">Input</th><th style="width:17%">Default</th><th>Meaning</th></tr>
+<tr><td class="k">notify_handy</td><td>empty</td><td>The service name without prefix. With <code>handys</code> the blueprint calls <code>notify.handys</code>.</td></tr>
+</table>
+<p class="new">The inputs notify_block_active and pause_timer were removed in V89.</p>
+
+<div class="pagebreak"></div>
+<h2>8. Recommended settings by facade orientation</h2>
+<table>
+<tr><th style="width:11%">Facade</th><th style="width:16%">Switchover time</th><th style="width:19%">Shading am / pm</th><th>Rationale</th></tr>
+<tr><td>East</td><td>approx. 10:00</td><td>20–30 % / 30 %</td><td>Early, low sun causes strong glare. After midday the facade is in shade – shading then ends automatically because <code>sonne_auf_f</code> becomes false.</td></tr>
+<tr><td>South</td><td>approx. 11:00–13:00</td><td>50–65 % / 30–65 %</td><td>High sun. Partial shading is often enough because the roof overhang helps.</td></tr>
+<tr><td>West</td><td>approx. 15:00</td><td>60 % / 40 %</td><td>Low, aggressive afternoon sun. Close further in the afternoon than in the morning – the most common misconfiguration is exactly the reverse order.</td></tr>
+<tr><td>North</td><td>any</td><td>–</td><td>Shading mostly unnecessary. The blueprint is still useful for ventilation, night closing and walk-through.</td></tr>
+</table>
+
+<h3>Commissioning procedure</h3>
+<ol>
+<li>Set up one shutter first and observe it for one or two sunny days.</li>
+<li>Does it lower too rarely? → Lower the lux or PV threshold.</li>
+<li>Does it lower too often or on cloudy days? → Raise the thresholds or let the weather check take effect.</li>
+<li>Does it oscillate? → Increase the gap between <code>raumtemp_min</code> and <code>raumtemp_max</code>.</li>
+<li>Only once one shutter runs cleanly, transfer the settings to the rest.</li>
+</ol>
+
+<h2>9. The manual override</h2>
+<p>The blueprint tries to detect whether a shutter has been moved by hand to a position it would never choose itself. If so, it holds back its daytime logic and respects the user's decision.</p>
+<p>Detection works via the current position. Counted as "automatic" – with ±2 % tolerance:</p>
+<ul>
+<li><code>max_oeffnung</code>, both shading positions, <code>lueftungs_pos</code>, <code>durchgangs_pos</code>, <code>hitze_extrem_pos</code></li>
+<li>fully closed (≤ 5 %)</li>
+</ul>
+<p>Any other position counts as a manual override. In addition, a closed shutter <em>after</em> the morning opening lock also counts as manually closed – whoever lowers the shutters again at 11 in the morning evidently wants to be left alone.</p>
+<div class="note"><p><strong>Important:</strong> the override only holds back the daytime logic (shading, raising, extreme-heat protection). It is deliberately ignored for: fire alarm, walk-through/cross-ventilation and evening closing. Safety and window logic always take precedence.</p></div>
+<div class="warn"><p><strong>Side effect when configuring:</strong> if two positions happen to be very close together (e.g. ventilation 30 % and shading 30 %), the blueprint can no longer tell them apart. Choose positions at least 10 % apart.</p></div>
+
+<div class="pagebreak"></div>
+<h2>10. Working with a fire-alarm automation</h2>
+<p>The blueprint does <strong>not</strong> open shutters on a fire alarm itself – it stays quiet. Opening them as an escape route is handled by a separate automation. This division of labour is deliberate: otherwise the two would overwrite each other.</p>
+<p>Example of the corresponding automation (abridged):</p>
+<pre>alias: "Safety: FIRE ALARM"
+mode: parallel
+triggers:
+  - trigger: state
+    entity_id:
+      - binary_sensor.rauchmelder_wohnzimmer
+      - binary_sensor.rauchmelder_flur
+      - binary_sensor.hitzemelder_kueche
+    to: "on"
+actions:
+  # 1. Set the boolean -&gt; the blueprint withdraws immediately
+  - action: input_boolean.turn_on
+    target:
+      entity_id: input_boolean.brandalarm_status
+
+  # 2. Critical push notification
+  - action: notify.handys
+    data:
+      title: "FIRE ALARM!"
+      message: "Triggered by: {{ trigger.to_state.name }}"
+      data:
+        priority: high
+        channel: alarm_stream
+
+  # 3. Open all shutters as an escape route
+  - action: cover.set_cover_position
+    target:
+      entity_id:
+        - cover.rollo_wohnzimmer
+        - cover.rollo_schlafzimmer
+    data:
+      position: 100
+
+  # 4. Escape route lighting
+  - action: light.turn_on
+    target:
+      entity_id: light.flur
+    data:
+      brightness_pct: 100</pre>
+<p><strong>The boolean is not reset on its own.</strong> As long as <code>input_boolean.brandalarm_status</code> is <code>on</code>, all shutter automations are dormant – even after a harmless false alarm from cooking fumes or dust. The automations still show as <code>on</code> and look perfectly healthy; they simply bail out into branch 0 on every run. The fault is practically invisible from the outside. The two building blocks below solve this.</p>
+
+<h3>10.1 Acknowledged reset via push notification</h3>
+<p>An automatic reset would be dangerous: after a real event you do not want the shutters closing again on their own. Hence the solution with human confirmation – two additional automations.</p>
+<h4>Automation A – offer the reset</h4>
+<p>Once all detectors have been quiet for 10 minutes and the boolean is still active, a push notification with action buttons arrives:</p>
+<pre>alias: "Safety: FIRE ALARM offer reset"
+mode: single
+triggers:
+  - trigger: state
+    entity_id:
+      - binary_sensor.rauchmelder_wohnzimmer
+      - binary_sensor.rauchmelder_flur
+      # ... all further detectors
+    to: "off"
+    for:
+      minutes: 10
+  - trigger: state
+    entity_id: input_boolean.brandalarm_status
+    to: "on"
+    for:
+      minutes: 10
+conditions:
+  - condition: state
+    entity_id: input_boolean.brandalarm_status
+    state: "on"
+  - condition: state
+    entity_id:
+      - binary_sensor.rauchmelder_wohnzimmer
+      - binary_sensor.rauchmelder_flur
+      # ... all further detectors
+    state: "off"
+actions:
+  - action: notify.handys
+    data:
+      title: "Fire alarm: detectors quiet again"
+      message: &gt;-
+        All detectors have been clear for 10 minutes. The shutter control
+        is still DORMANT. Only confirm once the situation is resolved.
+      data:
+        ttl: 0
+        priority: high
+        actions:
+          - action: BRANDALARM_RESET
+            title: "Reset alarm"
+          - action: BRANDALARM_IGNORE
+            title: "Not yet"</pre>
+<h4>Automation B – reset confirmed</h4>
+<p>Reacts to the button press in the notification:</p>
+<pre>alias: "Safety: FIRE ALARM reset confirmed"
+mode: single
+triggers:
+  - trigger: event
+    event_type: mobile_app_notification_action
+    event_data:
+      action: BRANDALARM_RESET
+conditions:
+  - condition: state
+    entity_id: input_boolean.brandalarm_status
+    state: "on"
+actions:
+  - action: input_boolean.turn_off
+    target:
+      entity_id: input_boolean.brandalarm_status
+  - action: notify.handys
+    data:
+      title: "Fire alarm reset"
+      message: &gt;-
+        The shutter control is active again. Normal operation within
+        the next 5 minutes.</pre>
+<div class="fix"><p>If the button is never pressed, simply nothing happens – the shutters stay up. There is deliberately no timeout that takes the decision out of human hands. After the reset the shutters do not move all at once but take effect on the next regular run, i.e. within 5 minutes at most (<code>time_pattern</code>).</p></div>
+<p>When creating these via the HA API, the validator may report that <code>BRANDALARM_RESET</code> is "not found in service registry". That is a false positive – it is a notification action ID, not a service name.</p>
+
+<h3>10.2 Dashboard card as a second safety net</h3>
+<p>In case the phone is not at hand, the boolean should also be reachable in the UI. A conditional card shows it only while the alarm is active and disappears by itself after the reset:</p>
+<pre>type: conditional
+conditions:
+  - condition: state
+    entity: input_boolean.brandalarm_status
+    state: "on"
+card:
+  type: tile
+  entity: input_boolean.brandalarm_status
+  name: FIRE ALARM – shutter control locked
+  icon: mdi:fire-alert
+  color: red
+  features:
+    - type: toggle
+grid_options:
+  columns: full</pre>
+<p>Sensible position: right at the top of the main dashboard, directly below the person badges – there it is impossible to miss in an emergency but does not get in the way during normal operation because it is invisible.</p>
+
+<div class="pagebreak"></div>
+<h2>11. Troubleshooting and debugging</h2>
+<h3>Reading traces</h3>
+<p>Settings → Automations → the affected automation → menu top right → <em>Traces</em>. There HA shows for every run which <code>choose</code> branch was taken and with which variable values. The <em>Changed Variables</em> tab is the most informative – it lists <code>sonne_auf_f</code>, <code>hitze_alarm</code>, <code>beschattung_aktiv</code>, <code>is_manual_override</code> and <code>aktuelle_pos</code> in plain text.</p>
+<div class="note"><p>If a run hits a template error, the trace shows an <code>error</code> field and no <code>execution</code> instead of a chosen branch. This is the fastest way to tell a faulty variable apart from a wrong branch: on a template error no branch is reached at all, and the shutter stops moving entirely – including the daytime logic.</p></div>
+
+<h3>Typical symptoms</h3>
+<table>
+<tr><th style="width:30%">Symptom</th><th>Cause and remedy</th></tr>
+<tr><td>Shutter never shades</td><td>Check: indoor temperature above the winter lock? Sun within the azimuth window of the chosen orientation? Lux/PV threshold realistic? Does the weather entity report one of the recognised states?</td></tr>
+<tr><td>Shutter shades constantly</td><td>Usually an outdoor threshold set too low in combination with the OR logic. Raise the outdoor threshold.</td></tr>
+<tr><td class="new">Shutter shades on cool days although the indoor temperature is below the winter lock</td><td class="new">Check the blueprint version. Up to V88 hitze_alarm was always true below the winter lock: branch 4b shaded in sunshine and branch 4c (raising) was blocked. Fixed in V89.</td></tr>
+<tr><td>Shutter oscillates</td><td>Temperature thresholds too close together, or two positions too close together (override detection cannot separate them cleanly).</td></tr>
+<tr><td>Shutter does not rise in the morning</td><td>No presence detector triggered and <code>zeit_spaetestens</code> not yet reached. Or: <code>sonnenaufgang_woche</code> active and the sun has not risen yet in winter.</td></tr>
+<tr><td>Shutter ignores the daytime logic</td><td>Most likely <code>is_manual_override</code>. Move the shutter to a known position once (e.g. fully open), then the automation takes over again.</td></tr>
+<tr><td>Push notifications do not arrive</td><td>The notify service does not exist. Check under Developer tools → Actions whether <code>notify.&lt;name&gt;</code> is listed. After creating a notify group a restart is required.</td></tr>
+<tr><td>Nothing moves at all</td><td>Check <code>input_boolean.brandalarm_status</code> – if it is <code>on</code>, the blueprint is dormant. The conditional dashboard card from chapter 10.2 makes this immediately visible. If the traces show a <code>TypeError</code> or another template error instead, a variable is faulty – see the note above.</td></tr>
+<tr><td>Shutter closes right at sunset despite a configured offset</td><td>Check the blueprint version. Before V87 <code>sunset_offset</code> only affected the sunset trigger and was additionally defeated by <code>mode: restart</code>. From V87 the offset lives in the night condition.</td></tr>
+</table>
+
+<h3>Testing variables live</h3>
+<p>Developer tools → Template. This lets you check, for instance, whether the sun is currently on the facade:</p>
+<pre>Azimuth:   {{ state_attr('sun.sun', 'azimuth') }}
+Elevation: {{ state_attr('sun.sun', 'elevation') }}
+Position:  {{ state_attr('cover.rollo_wohnzimmer', 'current_position') }}</pre>
+<p>For the night start:</p>
+<pre>{% set offset = 15 %}
+Sunset:      {{ (state_attr('sun.sun','next_setting') | as_datetime
+                 - timedelta(days=1)) | as_local }}
+Night start: {{ (state_attr('sun.sun','next_setting') | as_datetime
+                 - timedelta(days=1)
+                 + timedelta(minutes=offset)) | as_local }}</pre>
+<div class="warn"><p><code>state_attr('sun.sun','next_setting')</code> returns a <strong>string</strong>, not a <code>datetime</code>. Without <code>| as_datetime</code> any arithmetic on it fails with a <code>TypeError</code>. This applies to your own templates just as much as to modifications of the blueprint.</p></div>
+<div class="warn"><p><strong>Always write condition variables as a single expression, never as an <code>{% if %}</code> block.</strong> A Jinja block does not return a boolean – it renders a multi-line string, and every non-empty string is truthy in Jinja. A block emitting the word <code>false</code> is therefore evaluated as <em>true</em>. Home Assistant only converts exact Python literals: <code>False</code>, capitalised. This is exactly what broke V87 (<code>ist_nacht</code> was true around the clock and the shutters closed at midday)<span class="new"> – and the same bug sat in the else branch of <code>hitze_alarm</code> up to V88, turning the winter lock into its opposite</span>. The correct form is a single expression using <code>and</code>/<code>or</code> that returns a real boolean. To verify in the template editor, print the raw value inside quotes – anything other than exactly <code>True</code> or <code>False</code> is a string.</p></div>
+
+<h2>12. Known limitations</h2>
+<ul>
+<li><strong>Position-capable shutters only.</strong> Pure open/close drives without <code>current_position</code> do not work.</li>
+<li><strong>No slat control.</strong> Venetian blinds with slat angles are only controlled by height.</li>
+<li><strong>One shutter per automation.</strong> That is intentional (individual parameters per window) but means a correspondingly large number of automations with many windows.</li>
+<li><strong>No shading calculation for neighbouring buildings or trees.</strong> The azimuth range is a rough model. Anyone with a row of trees in front of the west window has to adjust the angular range or the lux threshold accordingly.</li>
+<li><strong>No wind protection.</strong> For awnings or external blinds at risk from wind, an additional higher-level lock would be needed.</li>
+<li><strong>The fire-alarm boolean is not reset by the blueprint.</strong> That is intentional – the reset belongs in its own, acknowledged automation. See chapter 10.</li>
+<li>The <code>time_pattern</code> every 5 minutes means: a change to the conditions takes effect after 5 minutes at worst. This also applies to the start of night mode.</li>
+<li>Sunset is derived from <code>next_setting</code> minus one day and deviates by up to roughly 6 minutes around the equinoxes. See chapter 7.</li>
+</ul>
+
+<div class="pagebreak"></div>
+<h2>13. Changelog</h2>
+<table>
+<tr><th style="width:9%">Version</th><th>Changes</th></tr>
+<tr><td class="c"><strong class="new">V89</strong></td><td>Fix: the <strong>winter lock (<code>raumtemp_min_schwelle</code>) worked backwards</strong>. Below the threshold, <code>hitze_alarm</code> emitted the bare word <code>false</code> from an <code>{% else %}</code> branch – the same bug class as V88: a non-empty string, therefore truthy. Below the winter lock <code>hitze_alarm</code> was always true, so branch 4b shaded whenever the sun hit the façade and PV/illuminance was high, and branch 4c (raise) was blocked via <code>not hitze_alarm</code>. On exactly the cool days when solar gain is wanted, the shutters went into shading. <code>hitze_alarm</code> is now a single boolean expression; behaviour above the winter lock (including the 1 °C hysteresis while shading) is unchanged. <strong>Removed:</strong> inputs <code>pause_timer</code> and <code>notify_block_active</code> plus the unused variables <code>v_timer</code>, <code>v_notify_block_raw</code>, <code>v_notify_block</code> and <code>pause_aktiv</code>. <strong>Migration:</strong> remove both inputs from existing automations; the notification-pause timer helper is no longer needed. <strong>Corrected:</strong> <code>source_url</code> points to the actual path in the repository root.</td></tr>
+<tr><td class="c"><strong>V88</strong></td><td>Fix: V87 shipped a broken <code>ist_nacht</code> and <strong>must not be used</strong>. The condition was written as a <code>{% if %}</code> / <code>{% else %}</code> block that emitted the bare word <code>false</code>. A Jinja block does not return a boolean — it renders a multi-line <em>string</em> (<code>"\n  false\n"</code>), and every non-empty string is truthy. Home Assistant only converts exact Python literals (<code>False</code>, capitalised), so lowercase <code>false</code> stayed a string and evaluated as <strong>true</strong>. <code>ist_nacht</code> was therefore true around the clock: branch 3 fired at any hour and drove the shutters to the ventilation or closed position in broad daylight, while branch 4 (<code>not ist_nacht</code>) never ran at all. Fixed by expressing the condition as a single <code>and</code> expression, which returns a real boolean: above the horizon → <code>False</code>, below → the time comparison. Lesson for the blueprint in general: any variable used as a condition must be one expression, never an <code>{% if %}</code> block.</td></tr>
+<tr><td class="c"><strong>V87</strong></td><td><em>(broken, superseded by V88)</em> Fix: the configured <strong>sunset offset was effectively dead</strong>. It sat as a <code>delay</code> inside branch 3 and only ran when <code>trigger.id == 'sunset_event'</code>. Every other trigger — presence sensor, window contact, PV, house mode, safety net — went straight through, and <code>ist_nacht</code> was already true the moment the sun dropped below the horizon. Shutters therefore closed within minutes of sunset even with 60 minutes configured. Second, deeper problem: even the sunset path never worked, because the automation runs in <code>mode: restart</code> — the pending delay was aborted by the next trigger, since V85 (<code>/15</code> → <code>/5</code>) after at most 5 minutes, and the restarted run satisfied <code>ist_nacht</code> and closed immediately. Solution: the offset now lives in the <code>ist_nacht</code> variable instead of a delay, so it applies to <em>every</em> trigger and is immune to <code>mode: restart</code>. The delay construct in branch 3 was removed without replacement. No new trigger is required — the existing <code>/5</code> safety net fires branch 3 as soon as <code>ist_nacht</code> flips, so the worst-case imprecision is 5 minutes. <strong>All inputs are unchanged</strong> (<code>sunset_offset</code> keeps its key, type, default and selector), so a re-import updates existing automations without any reconfiguration. Note on the implementation: <code>state_attr('sun.sun','next_setting')</code> returns a <strong>string</strong>, not a <code>datetime</code>, so the expression needs <code>| as_datetime</code> before the subtraction. Without it the template raises a <code>TypeError</code>, <code>ist_nacht</code> fails to render, and neither branch 3 (<code>ist_nacht</code>) nor branch 4 (<code>not ist_nacht</code>) is reached — the shutter stops moving entirely. Branch 4 was deliberately left on <code>not ist_nacht</code>: during the new dusk phase (sun down, offset still running) both <code>ist_hell</code> and <code>ist_nacht</code> are false, and 4c uses that window to raise shutters still parked in a shading position, while manually closed ones stay down via <code>is_manual_override</code>.</td></tr>
+<tr><td class="c"><strong>V86</strong></td><td>Fix: branch 4c (raising) checked <code>not lueftung_aktiv</code>, which blocked raising for as long as a window was tilted – permanently, not just while shading was active. The shutter moved correctly into the shading or extreme-heat position via 4a/4b, but never came back up once the sun-position phase ended. Condition removed: throughout the blueprint the ventilation position is modelled as a <strong>minimum height</strong> – 1b only raises when the current position is below it, branch 3 closes only down to it in the evening, and 4a/4b do not check it either – not as a ceiling. <code>sperrschutz</code> remains in 4c, and since branch 4 only runs during the day, the night-time tilt logic in branch 3 is untouched.</td></tr>
+<tr><td class="c"><strong>V85</strong></td><td>Fix: the PV trigger was a <code>state</code> trigger with <code>for: 2min</code> and practically never fired on a continuously changing power sensor, because the <code>for</code> window restarted on every value change – so shading never reacted to PV power directly, only on the periodic net. Now a <code>numeric_state</code> trigger (<code>above</code>/<code>below</code> <code>pv_schwelle</code>, each <code>for: 2min</code>), which debounces correctly. Change: safety net (<code>time_pattern</code>) tightened from <code>/15</code> to <code>/5</code> minutes so the fine reopening edge at <code>pv_schwelle − 500</code> / <code>lux_schwelle − 5000</code> is caught within 5 instead of 15 minutes. <code>mode: restart</code> and the position guards still prevent redundant travel.</td></tr>
+<tr><td class="c"><strong>V84</strong></td><td>New: fully opened window raises the shutter completely when no sun-position mode is active (also at night, before opening time, from a manually closed state); only walkthrough position while shading is active. Fix: variable order – <code>sonne_auf_f</code> is now defined before <code>hitze_extrem</code>. New: workday sensor input for holiday detection. New: helper variables to disentangle the brightness logic.</td></tr>
+<tr><td class="c"><strong>V83</strong></td><td>Extreme-heat protection with a separate position and hysteresis over indoor and outdoor temperature.</td></tr>
+<tr><td class="c"><strong>V82</strong></td><td>Anti-flapping: debounced PV trigger, <code>mode: restart</code>, 15-minute safety net.</td></tr>
+</table>
+
+<div class="footer">
+<p>This documentation describes the blueprint "Master Roller Shutter Control V89". Use at your own risk – in particular the fire-alarm coupling should be tested end to end once before productive use (set the boolean by hand and check that all shutters react as expected).</p>
+<p>Passages highlighted in red mark changes compared with the previous documentation revision (as of V88).</p>
+</div>
+
+</body>
+</html>

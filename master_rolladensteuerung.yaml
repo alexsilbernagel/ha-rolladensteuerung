@@ -13,7 +13,7 @@ blueprint:
     - ENTFERNT: Inputs 'pause_timer' und 'notify_block_active' sowie die Variablen
       v_timer, v_notify_block_raw, v_notify_block und pause_aktiv. Sie wurden seit
       Wegfall der Blockade-Pause nirgends mehr ausgewertet. Bestehende Automatisierungen
-      sollten die beiden Inputs entfernen (sonst meldet HA unbekannte Inputs).
+      sollten die beiden Inputs entfernen.
     V88 - siehe README.
     V87 - Verzoegerung nach Sonnenuntergang wirkt jetzt tatsaechlich:
     - FIX: Der eingestellte sunset_offset war faktisch wirkungslos. Er lag als 'delay'
